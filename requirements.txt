@@ -1,0 +1,7 @@
+feedparser
+requests
+beautifulsoup4
+readability-lxml
+lxml
+google-genai
+python-dotenv
