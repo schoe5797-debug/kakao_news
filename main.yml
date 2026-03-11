@@ -27,9 +27,17 @@ jobs:
       - name: Run bot
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
           KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          # Optional tuning (set as Secrets only if you want):
+          # GEMINI_MODEL: gemini-2.0-flash
+          # MAX_ARTICLES: 10
+          # INTL_TARGET: 6
+          # NAVER_CLIENT_ID / NAVER_CLIENT_SECRET: for Naver OpenAPI
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
           MAX_ARTICLES: ${{ secrets.MAX_ARTICLES }}
+          INTL_TARGET: ${{ secrets.INTL_TARGET }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
         run: |
           python app.py

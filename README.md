@@ -1,6 +1,6 @@
 # 카카오톡 뉴스 요약 봇 (매일 08:00 KST, 0원)
 
-구글 뉴스 RSS에서 기사를 모으고, **Gemini API로 “근거 기반 요약”**을 만든 뒤, 카카오톡 **“나에게 보내기”**로 전송합니다. 실행은 GitHub Actions가 매일 자동으로 돌려서 **PC를 꺼도** 됩니다.
+구글 뉴스 RSS(해외) + 네이버 뉴스 오픈API(국내)에서 기사를 모으고, **Gemini API로 “근거 기반 요약”**을 만든 뒤, 카카오톡 **“나에게 보내기”**로 전송합니다. 실행은 GitHub Actions가 매일 자동으로 돌려서 **PC를 꺼도** 됩니다.
 
 ## 핵심 안전장치(할루시네이션 방지)
 
@@ -22,6 +22,18 @@
 3. 아래 Secrets 추가
    - `GEMINI_API_KEY`: 발급받은 키
    - (선택) `GEMINI_MODEL`: 예) `gemini-2.0-flash` (비우면 기본값 사용)
+   - (선택) `MAX_SOURCE_CHARS`: 기사 1개당 모델 입력 텍스트 길이 제한(기본 1400)
+
+### 2-1) (선택) 네이버 뉴스 오픈API 추가(국내 뉴스 강화)
+
+네이버는 **국내 뉴스** 수집에 사용합니다. (해외는 구글 뉴스 RSS가 주도)
+
+1. `https://developers.naver.com`에서 애플리케이션 생성(검색 API)
+2. 발급된 값 2개를 GitHub Secrets에 추가
+   - `NAVER_CLIENT_ID`
+   - `NAVER_CLIENT_SECRET`
+
+> 네이버 키를 넣지 않으면, 봇은 자동으로 “구글 뉴스(해외)만”으로도 동작합니다.
 
 ### 3) 카카오 “나에게 보내기” 토큰 준비(중요)
 
@@ -31,7 +43,7 @@ GitHub Actions는 매일 자동 실행이라, 매번 로그인할 수 없습니�
 
 1. [Kakao Developers](https://developers.kakao.com/) 로그인
 2. **내 애플리케이션 → 애플리케이션 추가하기**
-3. 앱 생성 후 **요약 정보**에서 **REST API 키** 확인
+3. 앱 생성 후 **플랫폼 키 → REST API 키(기본 키)** 값 확인
 
 #### 3-2. 카카오톡 메시지 권한 켜기
 
@@ -71,6 +83,7 @@ GitHub 저장소 → Settings → Secrets and variables → Actions → New repo
 - `KAKAO_REST_API_KEY`: 카카오 REST API 키
 - `KAKAO_REFRESH_TOKEN`: 위 단계에서 발급된 refresh_token
 - (선택) `MAX_ARTICLES`: 예) `10`
+- (선택) `INTL_TARGET`: 해외(구글) 기사 비중(기본 6, 총합은 MAX_ARTICLES)
 
 ### 4) GitHub Actions 실행 확인
 
@@ -94,6 +107,10 @@ pip install -r requirements.txt
 GEMINI_API_KEY=...
 KAKAO_REST_API_KEY=...
 KAKAO_REFRESH_TOKEN=...
+NAVER_CLIENT_ID=...           # 선택
+NAVER_CLIENT_SECRET=...       # 선택
+MAX_ARTICLES=10               # 선택
+INTL_TARGET=6                 # 선택
 ```
 
 4. 실행

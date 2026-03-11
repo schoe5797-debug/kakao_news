@@ -1,10 +1,13 @@
+import html as ihtml
 import json
 import os
 import re
 import textwrap
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, List, Optional
+from urllib.parse import urlparse
 
 import feedparser
 import requests
@@ -37,6 +40,32 @@ def _env(name: str, default: Optional[str] = None) -> str:
     return val
 
 
+def _env_optional(name: str) -> Optional[str]:
+    val = os.getenv(name)
+    if val is None:
+        return None
+    val = val.strip()
+    return val if val else None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if raw == "":
+        return default
+    return int(raw)
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    return raw if raw else default
+
+
 KST = timezone(timedelta(hours=9))
 
 
@@ -59,6 +88,62 @@ def fetch_rss_entries(rss_urls: List[str], timeout_s: int = 15) -> List[dict]:
         seen.add(link)
         uniq.append(e)
     return uniq
+
+
+def fetch_naver_news_entries(queries: List[str], display_per_query: int = 10) -> List[dict]:
+    """
+    Naver Search News OpenAPI. Requires env:
+      - NAVER_CLIENT_ID
+      - NAVER_CLIENT_SECRET
+    If missing, returns [] (so the bot can still run with Google only).
+    """
+    client_id = _env_optional("NAVER_CLIENT_ID")
+    client_secret = _env_optional("NAVER_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        return []
+
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret,
+    }
+
+    out: List[dict] = []
+    for q in queries:
+        try:
+            r = requests.get(
+                "https://openapi.naver.com/v1/search/news.json",
+                headers=headers,
+                params={"query": q, "display": display_per_query, "sort": "date"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            continue
+
+        for item in data.get("items", []):
+            title_raw = item.get("title") or ""
+            desc_raw = item.get("description") or ""
+
+            title = BeautifulSoup(ihtml.unescape(title_raw), "html.parser").get_text(" ", strip=True)
+            desc = BeautifulSoup(ihtml.unescape(desc_raw), "html.parser").get_text(" ", strip=True)
+            link = (item.get("originallink") or item.get("link") or "").strip()
+            if not title or not link:
+                continue
+
+            out.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "summary": desc,
+                    "description": desc,
+                    "published": (item.get("pubDate") or "").strip(),
+                    # Mark as Naver for later grouping/dedupe preference
+                    "source": {"title": "Naver"},
+                    "_provider": "naver",
+                }
+            )
+    return out
 
 
 def extract_article_text(url: str, timeout_s: int = 15, max_chars: int = 6000) -> str:
@@ -122,6 +207,79 @@ def build_articles(entries: List[dict], max_articles: int = 12) -> List[Article]
     return articles
 
 
+def _normalize_title(title: str) -> str:
+    t = title.lower()
+    t = re.sub(r"\s+", " ", t).strip()
+    # Remove most punctuation to improve cross-source matching
+    t = re.sub(r"[^\w\s가-힣]", "", t)
+    return t
+
+
+def _root_domain(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower()
+        host = host.split("@")[-1]
+        host = host.split(":")[0]
+        parts = host.split(".")
+        if len(parts) >= 2:
+            return ".".join(parts[-2:])
+        return host
+    except Exception:
+        return ""
+
+
+def dedupe_entries(entries: List[dict], prefer_provider: str) -> List[dict]:
+    """
+    Dedupe by URL and normalized title. When clashes happen, prefer entries whose
+    _provider matches prefer_provider (e.g., prefer naver for domestic bucket).
+    """
+    by_url: OrderedDict[str, dict] = OrderedDict()
+    for e in entries:
+        url = (e.get("link") or "").strip()
+        if not url:
+            continue
+        if url not in by_url:
+            by_url[url] = e
+    entries2 = list(by_url.values())
+
+    chosen: OrderedDict[str, dict] = OrderedDict()
+    for e in entries2:
+        key = _normalize_title((e.get("title") or "").strip())
+        if not key:
+            continue
+        if key not in chosen:
+            chosen[key] = e
+            continue
+        cur = chosen[key]
+        cur_p = (cur.get("_provider") or "").lower()
+        new_p = (e.get("_provider") or "").lower()
+        if new_p == prefer_provider and cur_p != prefer_provider:
+            chosen[key] = e
+    return list(chosen.values())
+
+
+def select_mixed_entries(
+    *,
+    intl_entries: List[dict],
+    domestic_entries: List[dict],
+    max_total: int,
+    intl_target: int,
+) -> List[dict]:
+    intl_target = max(0, min(intl_target, max_total))
+    dom_target = max_total - intl_target
+
+    picked: List[dict] = []
+    picked.extend(intl_entries[:intl_target])
+    picked.extend(domestic_entries[:dom_target])
+
+    # If one side doesn't have enough, fill from the other.
+    if len(picked) < max_total:
+        remaining = max_total - len(picked)
+        extra = intl_entries[intl_target:] + domestic_entries[dom_target:]
+        picked.extend(extra[:remaining])
+    return picked[:max_total]
+
+
 MEGA_KEYWORDS = [
     "war",
     "invasion",
@@ -162,9 +320,75 @@ def prioritize_articles(articles: List[Article]) -> List[Article]:
     return [a for _, _, a in scored]
 
 
+def reindex_articles(articles: List[Article]) -> List[Article]:
+    return [
+        Article(
+            idx=i + 1,
+            title=a.title,
+            url=a.url,
+            source=a.source,
+            published=a.published,
+            text=a.text,
+        )
+        for i, a in enumerate(articles)
+    ]
+
+
+TOPIC_ORDER = [
+    ("메가이슈/지정학", ["war", "invasion", "missile", "nuclear", "attack", "coup", "sanction", "tariff"]),
+    ("거시/금리/인플레", ["fed", "rate", "rate hike", "inflation", "cpi", "jobs", "gdp", "recession"]),
+    ("반도체/칩", ["semiconductor", "chip", "hbm", "dram", "nand", "tsmc", "nvidia", "삼성", "삼성전자", "반도체"]),
+    ("에너지/유가", ["opec", "oil", "gas", "lng", "brent", "wti", "유가", "원유", "가스", "에너지"]),
+    ("AI/빅테크", ["ai", "openai", "microsoft", "google", "alphabet", "anthropic", "gpu", "모델", "인공지능"]),
+    ("한국 정책/시장", ["korea", "kospi", "kosdaq", "금통위", "한국은행", "기재부", "금리", "원달러", "환율"]),
+]
+
+
+def article_topics(a: Article) -> List[str]:
+    hay = f"{a.title}\n{a.text}".lower()
+    topics: List[str] = []
+    for label, kws in TOPIC_ORDER:
+        if any(k.lower() in hay for k in kws):
+            topics.append(label)
+    return topics
+
+
+def build_extra_links(
+    *,
+    selected: List[Article],
+    remaining: List[Article],
+    max_links: int,
+) -> List[tuple[str, str]]:
+    present = set()
+    for a in selected:
+        present.update(article_topics(a))
+
+    extras: List[tuple[str, str]] = []
+    used_urls = {a.url for a in selected}
+    for label, _kws in TOPIC_ORDER:
+        if len(extras) >= max_links:
+            break
+        if label in present:
+            continue
+        pick = None
+        for a in remaining:
+            if a.url in used_urls:
+                continue
+            if label in article_topics(a):
+                pick = a
+                break
+        if pick:
+            extras.append((label, pick.url))
+            used_urls.add(pick.url)
+    return extras
+
+
 def make_prompt(articles: List[Article]) -> str:
     sources_block = []
     for a in articles:
+        # Keep input compact to reduce quota pressure
+        max_chars = _env_int("MAX_SOURCE_CHARS", 1400)
+        a_text = a.text[:max_chars]
         sources_block.append(
             textwrap.dedent(
                 f"""
@@ -174,7 +398,7 @@ def make_prompt(articles: List[Article]) -> str:
                 OUTLET: {a.source}
                 URL: {a.url}
                 TEXT:
-                {a.text}
+                {a_text}
                 """
             ).strip()
         )
@@ -221,7 +445,7 @@ def make_prompt(articles: List[Article]) -> str:
 
 def gemini_summarize(prompt: str) -> str:
     api_key = _env("GEMINI_API_KEY")
-    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    model = _env_str("GEMINI_MODEL", "gemini-2.0-flash")
 
     from google import genai
     from google.genai import types
@@ -324,24 +548,62 @@ def chunk_text(text: str, max_len: int = 900) -> List[str]:
 def main() -> None:
     load_dotenv()
 
-    rss_urls = [
-        # Google News: Top stories + business + technology + finance-ish queries
-        "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko",
-        "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=ko&gl=KR&ceid=KR:ko",
-        "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=ko&gl=KR&ceid=KR:ko",
-        "https://news.google.com/rss/search?q=%EC%82%BC%EC%84%B1%EC%A0%84%EC%9E%90%20%EB%B0%98%EB%8F%84%EC%B2%B4&hl=ko&gl=KR&ceid=KR:ko",
-        "https://news.google.com/rss/search?q=NVIDIA%20%EB%B0%98%EB%8F%84%EC%B2%B4&hl=ko&gl=KR&ceid=KR:ko",
-        "https://news.google.com/rss/search?q=%EC%97%90%EB%84%88%EC%A7%80%20OPEC%20%EC%9C%A0%EA%B0%80&hl=ko&gl=KR&ceid=KR:ko",
-        "https://news.google.com/rss/search?q=Palantir%20%EC%A3%BC%EA%B0%80%20AI&hl=ko&gl=KR&ceid=KR:ko",
-        "https://news.google.com/rss/search?q=Microsoft%20Google%20AI%20chip&hl=ko&gl=KR&ceid=KR:ko",
+    max_total = _env_int("MAX_ARTICLES", 10)
+    # Default mix: overseas(google) 6 + domestic(naver) 4 (total 10)
+    intl_target = _env_int("INTL_TARGET", 6)
+    candidate_total = max(max_total, _env_int("CANDIDATE_ARTICLES", max_total * 3))
+
+    # Overseas: Google News (English / global) feeds
+    google_intl_rss = [
+        "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=semiconductor%20NVIDIA&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=energy%20OPEC%20oil%20gas&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=Palantir%20AI&hl=en-US&gl=US&ceid=US:en",
+        "https://news.google.com/rss/search?q=Microsoft%20Google%20AI%20chip&hl=en-US&gl=US&ceid=US:en",
     ]
+    intl_entries = fetch_rss_entries(google_intl_rss)
+    for e in intl_entries:
+        e["_provider"] = "google"
 
-    entries = fetch_rss_entries(rss_urls)
-    articles = build_articles(entries, max_articles=int(os.getenv("MAX_ARTICLES", "10")))
+    # Domestic: Naver News OpenAPI (Korean)
+    naver_queries = [
+        "국내 경제",
+        "반도체 삼성전자",
+        "엔비디아 반도체",
+        "두산에너빌리티",
+        "에너지 유가 OPEC",
+        "팔란티어",
+        "구글 AI",
+        "마이크로소프트 AI",
+    ]
+    domestic_entries = fetch_naver_news_entries(naver_queries, display_per_query=10)
+
+    # Dedupe within each bucket first
+    intl_entries = dedupe_entries(intl_entries, prefer_provider="google")
+    domestic_entries = dedupe_entries(domestic_entries, prefer_provider="naver")
+
+    # Cross-bucket dedupe: if same normalized title appears, keep domestic (naver) version.
+    seen_titles = {_normalize_title((e.get("title") or "").strip()) for e in domestic_entries}
+    intl_entries = [e for e in intl_entries if _normalize_title((e.get("title") or "").strip()) not in seen_titles]
+
+    mixed_entries = select_mixed_entries(
+        intl_entries=intl_entries,
+        domestic_entries=domestic_entries,
+        max_total=candidate_total,
+        intl_target=intl_target,
+    )
+
+    articles_all = build_articles(mixed_entries, max_articles=candidate_total)
+    articles_all = prioritize_articles(articles_all)
+    selected = articles_all[:max_total]
+    remaining = articles_all[max_total:]
+    selected = reindex_articles(selected)
+    articles = selected
     if not articles:
-        raise RuntimeError("No articles collected from RSS.")
+        raise RuntimeError("No articles collected from Google RSS / Naver API.")
 
-    articles = prioritize_articles(articles)
     prompt = make_prompt(articles)
 
     summary = gemini_summarize(prompt)
@@ -350,6 +612,17 @@ def main() -> None:
 
     allowed_urls = [a.url for a in articles]
     summary = filter_output_urls(summary, allowed_urls)
+
+    extra_links = build_extra_links(
+        selected=articles,
+        remaining=remaining,
+        max_links=_env_int("EXTRA_LINKS_MAX", 5),
+    )
+    if extra_links:
+        extra_block = ["\n[바쁜 날 참고 링크(요약에 못 담은 분야)]"]
+        for label, url in extra_links:
+            extra_block.append(f"- {label}: {url}")
+        summary = summary.rstrip() + "\n" + "\n".join(extra_block) + "\n"
 
     # Add a timestamp header for clarity
     kst_now = datetime.now(timezone.utc).astimezone(KST)
