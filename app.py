@@ -116,7 +116,6 @@ def fetch_naver_news_entries(queries: List[str], display_per_query: int = 10) ->
                 params={"query": q, "display": display_per_query, "sort": "date"},
                 timeout=15,
             )
-            print("카카오 응답:", r.status_code, r.text)
             r.raise_for_status()
             data = r.json()
         except Exception:
@@ -497,6 +496,7 @@ def kakao_refresh_access_token(rest_api_key: str, refresh_token: str) -> str:
         data=data,
         timeout=15,
     )
+    print("카카오 응답:", r.status_code, r.text)
     r.raise_for_status()
     data = r.json()
     token = data.get("access_token")
