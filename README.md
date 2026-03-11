@@ -82,6 +82,7 @@ GitHub 저장소 → Settings → Secrets and variables → Actions → New repo
 
 - `KAKAO_REST_API_KEY`: 카카오 REST API 키
 - `KAKAO_REFRESH_TOKEN`: 위 단계에서 발급된 refresh_token
+- (선택) `KAKAO_CLIENT_SECRET`: 카카오 앱에서 Client Secret 사용(ON)일 때 필요
 - (선택) `MAX_ARTICLES`: 예) `10`
 - (선택) `INTL_TARGET`: 해외(구글) 기사 비중(기본 6, 총합은 MAX_ARTICLES)
 
@@ -107,6 +108,7 @@ pip install -r requirements.txt
 GEMINI_API_KEY=...
 KAKAO_REST_API_KEY=...
 KAKAO_REFRESH_TOKEN=...
+KAKAO_CLIENT_SECRET=...      # 선택(카카오 Client Secret 사용 시)
 NAVER_CLIENT_ID=...           # 선택
 NAVER_CLIENT_SECRET=...       # 선택
 MAX_ARTICLES=10               # 선택

@@ -482,14 +482,18 @@ def filter_output_urls(text: str, allowed_urls: Iterable[str]) -> str:
 
 
 def kakao_refresh_access_token(rest_api_key: str, refresh_token: str) -> str:
+    client_secret = _env_optional("KAKAO_CLIENT_SECRET")
+    data = {
+        "grant_type": "refresh_token",
+        "client_id": rest_api_key,
+        "refresh_token": refresh_token,
+    }
+    if client_secret:
+        data["client_secret"] = client_secret
     r = requests.post(
         "https://kauth.kakao.com/oauth/token",
         headers={"Content-Type": "application/x-www-form-urlencoded;charset=utf-8"},
-        data={
-            "grant_type": "refresh_token",
-            "client_id": rest_api_key,
-            "refresh_token": refresh_token,
-        },
+        data=data,
         timeout=15,
     )
     r.raise_for_status()
