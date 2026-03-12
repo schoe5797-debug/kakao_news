@@ -2,7 +2,6 @@ name: kakao-news-briefing
 
 on:
   schedule:
-    # 08:00 KST == 23:00 UTC (전날)
     - cron: "0 23 * * *"
   workflow_dispatch: {}
 
@@ -10,6 +9,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:               # 추가: 파일 수정을 위한 권한
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,5 +33,15 @@ jobs:
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
           KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
           MAX_ARTICLES: ${{ secrets.MAX_ARTICLES }}
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
         run: |
           python app.py
+
+      - name: Update GitHub Pages     # 추가: 생성된 index.html을 레포에 업로드
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add index.html
+          git commit -m "Update daily news page" || echo "No changes"
+          git push
