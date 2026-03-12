@@ -216,8 +216,8 @@ def main() -> None:
         f.write(html_content)
 
     # 3. 고유 URL 설정 (★★★ 본인 정보로 수정 필수 ★★★)
-    GITHUB_ID = "당신의_아이디"
-    REPO_NAME = "당신의_레포지토리_이름"
+    GITHUB_ID = "schoe5797-debug"
+    REPO_NAME = "schoe5797-debug/kakao_news"
     page_url = f"https://{GITHUB_ID}.github.io/{REPO_NAME}/"
 
     # 4. 카톡 전송
