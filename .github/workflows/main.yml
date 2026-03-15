@@ -1,8 +1,6 @@
 name: kakao-news-briefing
-
 on:
   schedule:
-    # 08:00 KST == 23:00 UTC (전날)
     - cron: "0 23 * * *"
   workflow_dispatch: {}
 
@@ -10,6 +8,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write  # ← 추가
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,3 +34,10 @@ jobs:
           MAX_ARTICLES: ${{ secrets.MAX_ARTICLES }}
         run: |
           python app.py
+
+      - name: Deploy to GitHub Pages  # ← 추가
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./
+          publish_branch: gh-pages
