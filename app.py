@@ -142,37 +142,33 @@ def kakao_send_to_me(access_token: str, text: str, page_url: str) -> None:
 def main() -> None:
     load_dotenv()
 
-    summary = "뉴스 요약 데이터..."  # 실제 Gemini 결과값
+    summary = "뉴스 요약 데이터..."
     header = f"[뉴스 브리핑] {datetime.now(KST).strftime('%Y-%m-%d')}\n"
 
-    # HTML 생성
     html_content = f"<html><body><h1>{header}</h1><pre>{summary}</pre></body></html>"
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html_content)
 
-    # ★ REPO_NAME에 GitHub ID 중복 제거
     GITHUB_ID = "schoe5797-debug"
-    REPO_NAME = "kakao_news"  # ← 수정: ID 빼고 레포명만
+    REPO_NAME = "kakao_news"
     page_url = f"https://{GITHUB_ID}.github.io/{REPO_NAME}/"
     print(f"[page_url] {page_url}")
 
-    # ★ 토큰 갱신 결과 확인
-   token_resp = requests.post(
-    "https://kauth.kakao.com/oauth/token",
-    data={
-        "grant_type": "refresh_token",
-        "client_id": _env("KAKAO_REST_API_KEY"),
-        "client_secret": _env("KAKAO_CLIENT_SECRET"),  # ← 추가
-        "refresh_token": _env("KAKAO_REFRESH_TOKEN"),
-    },
-).json()
+    token_resp = requests.post(
+        "https://kauth.kakao.com/oauth/token",
+        data={
+            "grant_type": "refresh_token",
+            "client_id": _env("KAKAO_REST_API_KEY"),
+            "client_secret": _env("KAKAO_CLIENT_SECRET"),
+            "refresh_token": _env("KAKAO_REFRESH_TOKEN"),
+        },
+    ).json()
     print(f"[Kakao Token] {token_resp}")
 
     access_token = token_resp.get("access_token")
     if not access_token:
         raise RuntimeError(f"액세스 토큰 갱신 실패: {token_resp}")
 
-    # 카톡 전송
     kakao_send_to_me(access_token, header + "오늘 뉴스가 도착했습니다!", page_url)
 
 
