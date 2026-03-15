@@ -3,10 +3,9 @@ import json
 import os
 import re
 import textwrap
-from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Optional
+from typing import List, Optional
 from urllib.parse import urlparse
 
 import feedparser
@@ -27,6 +26,13 @@ class Article:
 
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+KST = timezone(timedelta(hours=9))
+
+RSS_URLS = [
+    "https://feeds.bbci.co.uk/news/rss.xml",
+    "https://rss.cnn.com/rss/edition.rss",
+    "https://www.yonhapnewstv.co.kr/browse/feed/",
+]
 
 
 def _env(name: str, default: Optional[str] = None) -> str:
@@ -49,9 +55,6 @@ def _env_int(name: str, default: int) -> int:
 def _env_str(name: str, default: str) -> str:
     raw = os.getenv(name)
     return raw.strip() if raw and raw.strip() else default
-
-
-KST = timezone(timedelta(hours=9))
 
 
 def fetch_rss_entries(rss_urls: List[str]) -> List[dict]:
@@ -111,6 +114,21 @@ def extract_article_text(url: str) -> str:
         return ""
 
 
+def collect_articles(max_articles: int) -> List[Article]:
+    entries = fetch_rss_entries(RSS_URLS)
+    entries += fetch_naver_news_entries(["오늘 뉴스", "주요 뉴스"])
+    articles = []
+    for idx, e in enumerate(entries[:max_articles]):
+        url = (e.get("link") or "").strip()
+        title = re.sub(r"<[^>]+>", "", e.get("title") or "").strip()
+        source = urlparse(url).netloc
+        published = e.get("published", "")
+        text = extract_article_text(url)
+        if title and url:
+            articles.append(Article(idx=idx, title=title, url=url, source=source, published=published, text=text))
+    return articles
+
+
 def gemini_summarize(prompt: str) -> str:
     from google import genai
     client = genai.Client(api_key=_env("GEMINI_API_KEY"))
@@ -121,23 +139,70 @@ def gemini_summarize(prompt: str) -> str:
     return (getattr(resp, "text", "")).strip()
 
 
+def build_summary(articles: List[Article]) -> str:
+    if not articles:
+        return "오늘 수집된 뉴스가 없습니다."
+
+    article_texts = ""
+    for a in articles:
+        article_texts += f"\n[{a.idx+1}] {a.title}\n출처: {a.source}\n{a.text[:1000]}\n"
+
+    prompt = f"""다음 뉴스 기사들을 한국어로 간결하게 요약해주세요.
+각 기사별로 핵심 내용을 2-3줄로 요약하고, 전체적인 오늘의 주요 뉴스 흐름도 마지막에 정리해주세요.
+
+{article_texts}
+"""
+    return gemini_summarize(prompt)
+
+
+def build_html(header: str, summary: str, articles: List[Article]) -> str:
+    article_links = ""
+    for a in articles:
+        article_links += f'<li><a href="{a.url}" target="_blank">{ihtml.escape(a.title)}</a> <span class="source">({a.source})</span></li>\n'
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{ihtml.escape(header)}</title>
+<style>
+  body {{ font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; line-height: 1.7; }}
+  h1 {{ font-size: 1.4em; color: #333; }}
+  pre {{ white-space: pre-wrap; background: #f9f9f9; padding: 20px; border-radius: 8px; }}
+  ul {{ padding-left: 20px; }}
+  .source {{ color: #888; font-size: 0.85em; }}
+</style>
+</head>
+<body>
+<h1>{ihtml.escape(header)}</h1>
+<h2>📰 뉴스 요약</h2>
+<pre>{ihtml.escape(summary)}</pre>
+<h2>🔗 원문 기사 목록</h2>
+<ul>
+{article_links}
+</ul>
+</body>
+</html>"""
+
+
 def kakao_send_to_me(access_token: str, text: str, page_url: str) -> None:
     template_object = {
         "object_type": "text",
         "text": text,
         "link": {
             "web_url": page_url,
-            "mobile_web_url": page_url
+            "mobile_web_url": page_url,
         },
         "buttons": [
             {
                 "title": "뉴스 요약 크게보기",
                 "link": {
                     "web_url": page_url,
-                    "mobile_web_url": page_url
-                }
+                    "mobile_web_url": page_url,
+                },
             }
-        ]
+        ],
     }
     resp = requests.post(
         "https://kapi.kakao.com/v2/api/talk/memo/default/send",
@@ -152,12 +217,20 @@ def kakao_send_to_me(access_token: str, text: str, page_url: str) -> None:
 def main() -> None:
     load_dotenv()
 
-    summary = "뉴스 요약 데이터..."
-    header = f"[뉴스 브리핑] {datetime.now(KST).strftime('%Y-%m-%d')}\n"
+    max_articles = _env_int("MAX_ARTICLES", 10)
+    header = f"[뉴스 브리핑] {datetime.now(KST).strftime('%Y-%m-%d')}"
 
-    html_content = f"<html><body><h1>{header}</h1><pre>{summary}</pre></body></html>"
+    print(f"[수집 시작] 최대 {max_articles}개 기사")
+    articles = collect_articles(max_articles)
+    print(f"[수집 완료] {len(articles)}개 기사")
+
+    summary = build_summary(articles)
+    print(f"[요약 완료]")
+
+    html_content = build_html(header, summary, articles)
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html_content)
+    print("[HTML 생성 완료]")
 
     GITHUB_ID = "schoe5797-debug"
     REPO_NAME = "kakao_news"
@@ -179,7 +252,7 @@ def main() -> None:
     if not access_token:
         raise RuntimeError(f"액세스 토큰 갱신 실패: {token_resp}")
 
-    kakao_send_to_me(access_token, header + "오늘 뉴스가 도착했습니다!", page_url)
+    kakao_send_to_me(access_token, f"{header}\n오늘 뉴스 {len(articles)}건이 도착했습니다!", page_url)
 
 
 if __name__ == "__main__":
