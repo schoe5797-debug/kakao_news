@@ -125,15 +125,25 @@ def kakao_send_to_me(access_token: str, text: str, page_url: str) -> None:
     template_object = {
         "object_type": "text",
         "text": text,
-        "link": {"web_url": page_url, "mobile_web_url": page_url},
-        "button_title": "뉴스 요약 크게보기",
+        "link": {
+            "web_url": page_url,
+            "mobile_web_url": page_url
+        },
+        "buttons": [
+            {
+                "title": "뉴스 요약 크게보기",
+                "link": {
+                    "web_url": page_url,
+                    "mobile_web_url": page_url
+                }
+            }
+        ]
     }
     resp = requests.post(
         "https://kapi.kakao.com/v2/api/talk/memo/default/send",
         headers={"Authorization": f"Bearer {access_token}"},
         data={"template_object": json.dumps(template_object, ensure_ascii=False)},
     )
-    # ★ 응답 확인
     print(f"[Kakao] status={resp.status_code}, body={resp.text}")
     if resp.status_code != 200:
         raise RuntimeError(f"카카오 전송 실패: {resp.status_code} {resp.text}")
