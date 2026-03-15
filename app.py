@@ -157,14 +157,15 @@ def main() -> None:
     print(f"[page_url] {page_url}")
 
     # ★ 토큰 갱신 결과 확인
-    token_resp = requests.post(
-        "https://kauth.kakao.com/oauth/token",
-        data={
-            "grant_type": "refresh_token",
-            "client_id": _env("KAKAO_REST_API_KEY"),
-            "refresh_token": _env("KAKAO_REFRESH_TOKEN"),
-        },
-    ).json()
+   token_resp = requests.post(
+    "https://kauth.kakao.com/oauth/token",
+    data={
+        "grant_type": "refresh_token",
+        "client_id": _env("KAKAO_REST_API_KEY"),
+        "client_secret": _env("KAKAO_CLIENT_SECRET"),  # ← 추가
+        "refresh_token": _env("KAKAO_REFRESH_TOKEN"),
+    },
+).json()
     print(f"[Kakao Token] {token_resp}")
 
     access_token = token_resp.get("access_token")
