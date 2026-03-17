@@ -81,126 +81,135 @@ NAVER_NEWSPAPER_RSS = [
     ("https://www.sedaily.com/RSS/economic.xml", "macro"),
 ]
 
+FALLBACK_TOPICS_PROMPT = """오늘은 {today}입니다. 뉴스 수집에 실패했거나 수집된 기사가 없습니다.
 
-def _env(name: str, default: Optional[str] = None) -> str:
-    val = os.getenv(name, default)
-    if val is None or val.strip() == "":
-        raise RuntimeError(f"Missing env: {name}")
-    return val
+대신, 투자자 관점에서 아래 보유 종목과 관련된 **현재 시장 주요 이슈**를 분석해주세요:
+- 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
 
+다음 주제들 중 현재 가장 시장에 영향을 미치는 내용을 선별하여 한국어로 작성해주세요:
 
-def _env_optional(name: str) -> Optional[str]:
-    val = os.getenv(name)
-    return val.strip() if val and val.strip() else None
+1. 📊 **금리 & 통화정책**: 미국 연준(Fed) 및 한국은행 기준금리 현황, 인플레이션 동향
+2. 🏢 **주요 기업 이슈**: 보유 종목 관련 최근 실적, 가이던스, 애널리스트 전망
+3. 💱 **환율 & 무역**: 원/달러 환율 동향, 미중 무역 관계, 수출 지표
+4. ⚡ **에너지 시장**: 유가, LNG 가격, 원전 정책 동향
+5. 🤖 **AI & 반도체 산업**: AI 수요 트렌드, 반도체 업황 사이클
+6. 🌏 **지정학적 리스크**: 주요 분쟁 지역 동향, 공급망 리스크
 
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    return int(raw.strip()) if raw and raw.strip() else default
-
-
-def _env_str(name: str, default: str) -> str:
-    raw = os.getenv(name)
-    return raw.strip() if raw and raw.strip() else default
+각 항목별 3줄 이내로 요약하고, 보유 종목에 미칠 영향(긍정/부정/중립)과 오늘의 투자 인사이트를 마지막에 정리해주세요.
+"""
 
 
-def fetch_google_rss(query: str) -> List[dict]:
-    """구글 뉴스 RSS로 해외 기사 수집"""
-    url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en&gl=US&ceid=US:en"
-    try:
-        feed = feedparser.parse(url)
-        return getattr(feed, "entries", [])
-    except Exception as e:
-        print(f"[Google RSS] 실패 ({query}): {e}")
-        return []
+FALLBACK_TOPICS_PROMPT = """오늘은 {today}입니다. 뉴스 수집에 실패했거나 수집된 기사가 없습니다.
+
+대신, 투자자 관점에서 아래 보유 종목과 관련된 **현재 시장 주요 이슈**를 분석해주세요:
+- 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
+
+다음 주제들 중 현재 가장 시장에 영향을 미치는 내용을 선별하여 한국어로 작성해주세요:
+
+1. 📊 **금리 & 통화정책**: 미국 연준(Fed) 및 한국은행 기준금리 현황, 인플레이션 동향
+2. 🏢 **주요 기업 이슈**: 보유 종목 관련 최근 실적, 가이던스, 애널리스트 전망
+3. 💱 **환율 & 무역**: 원/달러 환율 동향, 미중 무역 관계, 수출 지표
+4. ⚡ **에너지 시장**: 유가, LNG 가격, 원전 정책 동향
+5. 🤖 **AI & 반도체 산업**: AI 수요 트렌드, 반도체 업황 사이클
+6. 🌏 **지정학적 리스크**: 주요 분쟁 지역 동향, 공급망 리스크
+
+각 항목별 3줄 이내로 요약하고, 보유 종목에 미칠 영향(긍정/부정/중립)과 오늘의 투자 인사이트를 마지막에 정리해주세요.
+"""
 
 
-def fetch_naver_news(query: str) -> List[dict]:
-    """네이버 뉴스 API로 국내 기사 수집"""
-    client_id = _env_optional("NAVER_CLIENT_ID")
-    client_secret = _env_optional("NAVER_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        return []
-    try:
-        r = requests.get(
-            "https://openapi.naver.com/v1/search/news.json",
-            headers={
-                "X-Naver-Client-Id": client_id,
-                "X-Naver-Client-Secret": client_secret,
-            },
-            params={"query": query, "display": 5, "sort": "date"},
-            timeout=15,
-        )
-        return r.json().get("items", [])
-    except Exception as e:
-        print(f"[Naver] 실패 ({query}): {e}")
-        return []
+def build_summary(articles: List[Article], today: str) -> str:
+    if not articles:
+        prompt = FALLBACK_TOPICS_PROMPT.format(today=today)
+        return gemini_summarize(prompt)
 
+    def fmt(cat: str) -> str:
+        cat_articles = [a for a in articles if a.category == cat]
+        if cat_articles:
+            return "\n".join(
+                f"- [{a.source}] {a.title}\n  {a.text[:800]}"
+                for a in cat_articles
+            )
+        return f"[수집된 기사 없음 - 해당 분야 최신 동향을 {today} 기준으로 직접 분석해주세요]"
 
-def fetch_newspaper_rss(rss_url: str) -> List[dict]:
-    """신문사 RSS 수집"""
-    try:
-        feed = feedparser.parse(rss_url)
-        return getattr(feed, "entries", []) if not getattr(feed, "bozo", 0) else []
-    except Exception as e:
-        print(f"[RSS] 실패 ({rss_url}): {e}")
-        return []
+    # ── 1단계: 기사별 심층 분석 ──────────────────────────────
+    per_article_prompt = f"""오늘은 {today}입니다.
+아래 기사들을 **각각 개별적으로** 분석해주세요.
 
+분석 조건:
+- 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
+- 영어 기사는 한국어로 번역
 
-def extract_article_text(url: str) -> str:
-    try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
-        doc = Document(r.text)
-        soup = BeautifulSoup(doc.summary(), "html.parser")
-        return soup.get_text("\n", strip=True)[:5000]
-    except Exception as e:
-        print(f"[extract] 실패 ({url}): {e}")
-        return ""
+**날짜 및 중요도 우선순위 규칙 (반드시 준수)**
+- 오늘({today}) 발행된 기사를 최우선으로 다루세요.
+- 어제 날짜 기사는 오늘 기사가 충분하지 않거나, 해당 카테고리에서 대체할 만한
+  오늘 기사가 없을 경우에만 포함하세요.
+- 그보다 오래된 기사는 시장에 현재진행형으로 영향을 미치는 경우가 아니라면 제외하세요.
+- 오래된 기사를 포함할 경우 "(전일 이슈 지속)" 또는 "(n일 전)" 등으로 명시해주세요.
 
+**서술 방식**
+- 기사마다 제목을 먼저 쓰고, 아래 항목 중 해당되는 것만 자연스럽게 서술해주세요.
+  억지로 모든 항목을 채우지 말고, 기사 내용에 따라 깊이와 항목을 유연하게 조절하세요.
+  - 무슨 일이 일어났는지
+  - 관련 이해관계자들의 입장 (있을 경우: 예- 노사갈등, 정책 찬반, 기업간 분쟁 등)
+  - 왜 이 이슈가 중요한지 / 배경
+  - 앞으로 어떻게 흘러갈지 전망
+  - 보유 종목 중 해당 종목이 있다면 영향도 (긍정/부정/중립 + 이유)
+- 단순 수치 발표나 단신이라면 2~3줄로 간결하게 마무리해도 됩니다.
+- 노사갈등, 정책 변화, 대형 계약, 실적 서프라이즈처럼 파급력이 큰 이슈는
+  배경·입장·전망을 충분히 서술해주세요.
+- 기사가 없는 카테고리는 {today} 기준 해당 분야에서 가장 주목할 만한 이슈나
+  잠재 리스크를 자체 판단하여 작성해주세요.
 
-def collect_articles(max_articles: int) -> List[Article]:
-    raw: List[tuple] = []  # (title, url, category, source)
-    seen_urls: set = set()
+===== 반도체 =====
+{fmt("semiconductor")}
 
-    # 1) 구글 RSS (해외)
-    for query, category in GOOGLE_RSS_QUERIES:
-        for e in fetch_google_rss(query)[:3]:
-            url = (e.get("link") or "").strip()
-            title = re.sub(r"<[^>]+>", "", e.get("title") or "").strip()
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                raw.append((title, url, category, urlparse(url).netloc, e.get("published", "")))
+===== 에너지 =====
+{fmt("energy")}
 
-    # 2) 네이버 뉴스 API
-    for query, category in NAVER_QUERIES:
-        for item in fetch_naver_news(query):
-            url = (item.get("originallink") or item.get("link") or "").strip()
-            title = re.sub(r"<[^>]+>", "", item.get("title") or "").strip()
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                raw.append((title, url, category, urlparse(url).netloc, item.get("pubDate", "")))
+===== 거시경제 =====
+{fmt("macro")}
 
-    # 3) 신문사 RSS
-    for rss_url, category in NAVER_NEWSPAPER_RSS:
-        for e in fetch_newspaper_rss(rss_url)[:3]:
-            url = (e.get("link") or "").strip()
-            title = re.sub(r"<[^>]+>", "", e.get("title") or "").strip()
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                raw.append((title, url, category, urlparse(url).netloc, e.get("published", "")))
+===== 글로벌 이벤트 =====
+{fmt("global_event")}
+"""
 
-    # 본문 추출 후 Article 생성
-    articles = []
-    for idx, (title, url, category, source, published) in enumerate(raw[:max_articles]):
-        text = extract_article_text(url)
-        if title:
-            articles.append(Article(
-                idx=idx, title=title, url=url,
-                source=source, published=published,
-                text=text, category=category,
-            ))
-    return articles
+    per_article_analysis = gemini_summarize(per_article_prompt)
 
+    # ── 2단계: 카테고리별 종합 요약 + 투자 인사이트 ──────────
+    category_summary_prompt = f"""오늘은 {today}입니다.
+아래는 오늘 수집된 뉴스의 기사별 심층 분석 결과입니다.
+
+이를 바탕으로 **카테고리별 종합 요약**과 **투자 인사이트**를 작성해주세요.
+
+작성 조건:
+- 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
+- 비슷한 기사는 묶어서 중복 없이 정리
+- 각 카테고리 3줄 이내 핵심 요약
+- 마지막에 오늘의 투자 인사이트 (전체 종합, 종목별 대응 방향 포함)
+
+출력 형식:
+===== 💾 반도체 요약 =====
+(3줄 이내)
+
+===== ⚡ 에너지 요약 =====
+(3줄 이내)
+
+===== 📊 거시경제 요약 =====
+(3줄 이내)
+
+===== 🌏 글로벌 이벤트 요약 =====
+(3줄 이내)
+
+===== 💡 오늘의 투자 인사이트 =====
+(종목별 대응 방향 포함, 5줄 이내)
+
+--- 기사별 분석 원문 ---
+{per_article_analysis}
+"""
+
+    category_summary = gemini_summarize(category_summary_prompt)
+
+    return f"{category_summary}\n\n{'='*60}\n\n📋 기사별 상세 분석\n\n{'='*60}\n\n{per_article_analysis}"
 
 def gemini_summarize(prompt: str) -> str:
     from google import genai
