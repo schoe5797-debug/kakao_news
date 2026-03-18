@@ -121,6 +121,42 @@ def _env_int(key: str, default: int = 0) -> int:
         return default
 
 
+# ── 날짜 파싱 및 오늘 기사 여부 판단 ────────────────────────
+def parse_published(published: str) -> Optional[datetime]:
+    """RSS published 문자열을 datetime으로 변환합니다."""
+    if not published:
+        return None
+    formats = [
+        "%a, %d %b %Y %H:%M:%S %z",   # RFC 2822 (RSS 표준)
+        "%a, %d %b %Y %H:%M:%S GMT",
+        "%Y-%m-%dT%H:%M:%S%z",         # ISO 8601
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(published, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def is_today_or_recent(published: str, today_kst: datetime, max_hours: int = 24) -> bool:
+    """기사가 오늘(KST 기준) 발행됐는지 확인합니다.
+    published 파싱 실패 시 True를 반환해 기사를 보존합니다 (누락 방지).
+    """
+    dt = parse_published(published)
+    if dt is None:
+        return True  # 날짜 불명확 → 포함 (안전 처리)
+    # timezone-aware 비교
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    today_utc_start = today_kst.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    diff = today_kst.astimezone(timezone.utc) - dt
+    # 오늘 자정 이후이거나, max_hours 이내면 포함
+    return dt >= today_utc_start or diff.total_seconds() <= max_hours * 3600
+
+
 # ── 기사 본문 추출 ───────────────────────────────────────────
 def fetch_article_text(url: str, max_chars: int = 1500) -> str:
     """URL에서 기사 본문을 추출합니다."""
@@ -141,23 +177,34 @@ def fetch_article_text(url: str, max_chars: int = 1500) -> str:
 
 
 # ── 구글 뉴스 RSS 수집 ───────────────────────────────────────
-def collect_google_rss(max_per_query: int = 3) -> List[Article]:
-    """Google News RSS에서 기사를 수집합니다."""
+def collect_google_rss(max_per_query: int = 3, today_kst: Optional[datetime] = None) -> List[Article]:
+    """Google News RSS에서 오늘 기사를 수집합니다."""
     articles: List[Article] = []
     idx = 0
+    if today_kst is None:
+        today_kst = datetime.now(KST)
 
     for query, category in GOOGLE_RSS_QUERIES:
         encoded_query = quote(query)
-        rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en&gl=US&ceid=US:en"
+        # after: 파라미터로 구글 RSS 단계에서도 최근 기사만 요청
+        rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en&gl=US&ceid=US:en&after={today_kst.strftime('%Y-%m-%d')}"
         try:
             feed = feedparser.parse(rss_url)
-            for entry in feed.entries[:max_per_query]:
+            collected = 0
+            for entry in feed.entries:
+                if collected >= max_per_query:
+                    break
                 title = entry.get("title", "").strip()
                 url = entry.get("link", "").strip()
                 published = entry.get("published", "")
                 source = urlparse(url).netloc.replace("www.", "")
 
                 if not title or not url:
+                    continue
+
+                # 오늘 날짜 기사가 아니면 건너뜀
+                if not is_today_or_recent(published, today_kst):
+                    print(f"  [Google RSS 날짜 필터] 스킵: {published[:16]} | {title[:40]}")
                     continue
 
                 text = fetch_article_text(url)
@@ -171,6 +218,7 @@ def collect_google_rss(max_per_query: int = 3) -> List[Article]:
                     category=category,
                 ))
                 idx += 1
+                collected += 1
                 print(f"  [Google RSS] {category} | {title[:50]}")
         except Exception as e:
             print(f"  [Google RSS 실패] {query}: {e}")
@@ -179,10 +227,12 @@ def collect_google_rss(max_per_query: int = 3) -> List[Article]:
 
 
 # ── 네이버 뉴스 검색 수집 ────────────────────────────────────
-def collect_naver_search(max_per_query: int = 3) -> List[Article]:
-    """네이버 뉴스 검색 API로 기사를 수집합니다."""
+def collect_naver_search(max_per_query: int = 3, today_kst: Optional[datetime] = None) -> List[Article]:
+    """네이버 뉴스 검색 API로 오늘 기사를 수집합니다."""
     articles: List[Article] = []
-    idx = 10000  # 구글 RSS와 idx 충돌 방지
+    idx = 10000
+    if today_kst is None:
+        today_kst = datetime.now(KST)
 
     client_id = os.getenv("NAVER_CLIENT_ID")
     client_secret = os.getenv("NAVER_CLIENT_SECRET")
@@ -198,15 +248,19 @@ def collect_naver_search(max_per_query: int = 3) -> List[Article]:
 
     for query, category in NAVER_QUERIES:
         try:
+            # 넉넉하게 가져온 뒤 날짜 필터 적용
             resp = requests.get(
                 "https://openapi.naver.com/v1/search/news.json",
                 headers=headers,
-                params={"query": query, "display": max_per_query, "sort": "date"},
+                params={"query": query, "display": max_per_query * 3, "sort": "date"},
                 timeout=10,
             )
             resp.raise_for_status()
             items = resp.json().get("items", [])
+            collected = 0
             for item in items:
+                if collected >= max_per_query:
+                    break
                 title = BeautifulSoup(item.get("title", ""), "html.parser").get_text()
                 url = item.get("originallink") or item.get("link", "")
                 published = item.get("pubDate", "")
@@ -216,9 +270,12 @@ def collect_naver_search(max_per_query: int = 3) -> List[Article]:
                 if not title or not url:
                     continue
 
-                # 본문 추출 시도, 실패하면 description 사용
-                text = fetch_article_text(url) or description
+                # 오늘 날짜 기사가 아니면 건너뜀
+                if not is_today_or_recent(published, today_kst):
+                    print(f"  [Naver 날짜 필터] 스킵: {published[:16]} | {title[:40]}")
+                    continue
 
+                text = fetch_article_text(url) or description
                 articles.append(Article(
                     idx=idx,
                     title=title,
@@ -229,6 +286,7 @@ def collect_naver_search(max_per_query: int = 3) -> List[Article]:
                     category=category,
                 ))
                 idx += 1
+                collected += 1
                 print(f"  [Naver Search] {category} | {title[:50]}")
         except Exception as e:
             print(f"  [Naver Search 실패] {query}: {e}")
@@ -237,21 +295,31 @@ def collect_naver_search(max_per_query: int = 3) -> List[Article]:
 
 
 # ── 네이버 신문사 RSS 수집 ───────────────────────────────────
-def collect_naver_newspaper_rss(max_per_feed: int = 5) -> List[Article]:
-    """네이버 주요 신문사 RSS에서 기사를 수집합니다."""
+def collect_naver_newspaper_rss(max_per_feed: int = 5, today_kst: Optional[datetime] = None) -> List[Article]:
+    """네이버 주요 신문사 RSS에서 오늘 기사를 수집합니다."""
     articles: List[Article] = []
-    idx = 20000  # 다른 수집원과 idx 충돌 방지
+    idx = 20000
+    if today_kst is None:
+        today_kst = datetime.now(KST)
 
     for rss_url, category in NAVER_NEWSPAPER_RSS:
         try:
             feed = feedparser.parse(rss_url)
             source = urlparse(rss_url).netloc.replace("www.", "").replace("rss.", "")
-            for entry in feed.entries[:max_per_feed]:
+            collected = 0
+            for entry in feed.entries:
+                if collected >= max_per_feed:
+                    break
                 title = entry.get("title", "").strip()
                 url = entry.get("link", "").strip()
                 published = entry.get("published", "")
 
                 if not title or not url:
+                    continue
+
+                # 오늘 날짜 기사가 아니면 건너뜀
+                if not is_today_or_recent(published, today_kst):
+                    print(f"  [Newspaper 날짜 필터] 스킵: {published[:16]} | {title[:40]}")
                     continue
 
                 text = fetch_article_text(url)
@@ -265,6 +333,7 @@ def collect_naver_newspaper_rss(max_per_feed: int = 5) -> List[Article]:
                     category=category,
                 ))
                 idx += 1
+                collected += 1
                 print(f"  [Newspaper RSS] {category} | {title[:50]}")
         except Exception as e:
             print(f"  [Newspaper RSS 실패] {rss_url}: {e}")
@@ -288,15 +357,16 @@ def deduplicate(articles: List[Article]) -> List[Article]:
 def collect_articles(max_articles: int = 60) -> List[Article]:
     """모든 소스에서 기사를 수집하고 중복을 제거합니다."""
     all_articles: List[Article] = []
+    today_kst = datetime.now(KST)
 
     print("[1/3] 구글 뉴스 RSS 수집 중...")
-    all_articles += collect_google_rss(max_per_query=3)
+    all_articles += collect_google_rss(max_per_query=3, today_kst=today_kst)
 
     print("[2/3] 네이버 뉴스 검색 수집 중...")
-    all_articles += collect_naver_search(max_per_query=3)
+    all_articles += collect_naver_search(max_per_query=3, today_kst=today_kst)
 
     print("[3/3] 네이버 신문사 RSS 수집 중...")
-    all_articles += collect_naver_newspaper_rss(max_per_feed=5)
+    all_articles += collect_naver_newspaper_rss(max_per_feed=5, today_kst=today_kst)
 
     all_articles = deduplicate(all_articles)
     print(f"[중복 제거 후] {len(all_articles)}개")
@@ -319,6 +389,18 @@ def build_summary(articles: List[Article], today: str) -> str:
         prompt = FALLBACK_TOPICS_PROMPT.format(today=today)
         return gemini_summarize(prompt)
 
+    # 오늘 기사가 있는 카테고리 / 없는 카테고리 분류
+    CATEGORIES = ["semiconductor", "energy", "macro", "global_event"]
+    filled = {cat for cat in CATEGORIES if any(a.category == cat for a in articles)}
+    empty  = [cat for cat in CATEGORIES if cat not in filled]
+
+    CATEGORY_KR = {
+        "semiconductor": "반도체",
+        "energy": "에너지",
+        "macro": "거시경제",
+        "global_event": "글로벌 이벤트",
+    }
+
     def fmt(cat: str) -> str:
         cat_articles = [a for a in articles if a.category == cat]
         if cat_articles:
@@ -326,9 +408,36 @@ def build_summary(articles: List[Article], today: str) -> str:
                 f"- [{a.source}] {a.title}\n  {a.text[:800]}"
                 for a in cat_articles
             )
-        return f"[수집된 기사 없음 - 해당 분야 최신 동향을 {today} 기준으로 직접 분석해주세요]"
+        return ""  # 빈 카테고리는 별도 처리
+
+    # ── 빈 카테고리: Gemini에게 최근 핫이슈 요청 ────────────
+    hot_issue_sections = ""
+    if empty:
+        empty_kr = ", ".join(CATEGORY_KR[c] for c in empty)
+        hot_issue_prompt = f"""오늘은 {today}입니다.
+아래 카테고리에 대해 오늘 날짜({today}) 기준으로 **최근 며칠 사이 뉴스에 가장 많이 등장한 기업 이슈 또는 시장 이슈**를 카테고리별로 요약해주세요.
+
+조건:
+- 보유 종목 우선 언급: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
+- 보유 종목 이슈가 없다면 해당 분야에서 가장 화제가 된 기업/이슈를 대신 소개
+- 각 카테고리 3~5줄 이내
+- 출처가 불분명한 내용은 "추정" 또는 "알려진 바에 따르면" 등으로 표현
+
+요약이 필요한 카테고리: {empty_kr}
+
+각 카테고리 형식:
+===== [카테고리명] 최근 핫이슈 (자체 분석) =====
+(내용)
+"""
+        hot_issue_sections = gemini_summarize(hot_issue_prompt)
 
     # ── 1단계: 기사별 심층 분석 ──────────────────────────────
+    article_blocks = "\n\n".join(
+        f"===== {CATEGORY_KR[cat]} =====\n{fmt(cat)}"
+        for cat in CATEGORIES
+        if cat in filled
+    )
+
     per_article_prompt = f"""오늘은 {today}입니다.
 아래 기사들을 **각각 개별적으로** 분석해주세요.
 
@@ -336,66 +445,59 @@ def build_summary(articles: List[Article], today: str) -> str:
 - 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
 - 영어 기사는 한국어로 번역
 
-**날짜 및 중요도 우선순위 규칙 (반드시 준수)**
-- 오늘({today}) 발행된 기사를 최우선으로 다루세요.
-- 어제 날짜 기사는 오늘 기사가 충분하지 않거나, 해당 카테고리에서 대체할 만한
-  오늘 기사가 없을 경우에만 포함하세요.
-- 그보다 오래된 기사는 시장에 현재진행형으로 영향을 미치는 경우가 아니라면 제외하세요.
-- 오래된 기사를 포함할 경우 "(전일 이슈 지속)" 또는 "(n일 전)" 등으로 명시해주세요.
+**날짜 규칙 (엄격히 준수)**
+- 오늘({today}) 발행된 기사만 분석합니다.
+- 오늘 날짜가 아닌 기사는 분석하지 말고 "날짜 미해당 - 생략"으로 표시하세요.
+- 예외: 오늘 기사가 직접 언급하거나 이어지는 전날 이슈는 "(전일 이슈 지속)"으로 1줄만 표시.
 
 **서술 방식**
-- 기사마다 제목을 먼저 쓰고, 아래 항목 중 해당되는 것만 자연스럽게 서술해주세요.
-  억지로 모든 항목을 채우지 말고, 기사 내용에 따라 깊이와 항목을 유연하게 조절하세요.
+- 기사마다 제목을 먼저 쓰고, 아래 항목 중 해당되는 것만 자연스럽게 서술하세요.
   - 무슨 일이 일어났는지
-  - 관련 이해관계자들의 입장 (있을 경우: 예- 노사갈등, 정책 찬반, 기업간 분쟁 등)
+  - 관련 이해관계자들의 입장 (있을 경우)
   - 왜 이 이슈가 중요한지 / 배경
   - 앞으로 어떻게 흘러갈지 전망
-  - 보유 종목 중 해당 종목이 있다면 영향도 (긍정/부정/중립 + 이유)
+  - 보유 종목 영향도 (긍정/부정/중립 + 이유)
 - 단순 수치 발표나 단신이라면 2~3줄로 간결하게 마무리해도 됩니다.
-- 노사갈등, 정책 변화, 대형 계약, 실적 서프라이즈처럼 파급력이 큰 이슈는
-  배경·입장·전망을 충분히 서술해주세요.
-- 기사가 없는 카테고리는 {today} 기준 해당 분야에서 가장 주목할 만한 이슈나
-  잠재 리스크를 자체 판단하여 작성해주세요.
 
-===== 반도체 =====
-{fmt("semiconductor")}
-
-===== 에너지 =====
-{fmt("energy")}
-
-===== 거시경제 =====
-{fmt("macro")}
-
-===== 글로벌 이벤트 =====
-{fmt("global_event")}
+{article_blocks}
 """
 
     per_article_analysis = gemini_summarize(per_article_prompt)
 
     # ── 2단계: 카테고리별 종합 요약 + 투자 인사이트 ──────────
+    hot_section_note = ""
+    if hot_issue_sections:
+        empty_kr = ", ".join(CATEGORY_KR[c] for c in empty)
+        hot_section_note = f"""
+※ [{empty_kr}] 카테고리는 오늘 수집된 기사가 없어 최근 핫이슈로 대체합니다:
+
+{hot_issue_sections}
+"""
+
     category_summary_prompt = f"""오늘은 {today}입니다.
 아래는 오늘 수집된 뉴스의 기사별 심층 분석 결과입니다.
-
+{hot_section_note}
 이를 바탕으로 **카테고리별 종합 요약**과 **투자 인사이트**를 작성해주세요.
 
 작성 조건:
 - 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
 - 비슷한 기사는 묶어서 중복 없이 정리
 - 각 카테고리 3줄 이내 핵심 요약
+- 기사 없는 카테고리는 위 핫이슈 내용을 바탕으로 요약
 - 마지막에 오늘의 투자 인사이트 (전체 종합, 종목별 대응 방향 포함)
 
 출력 형식:
 ===== 💾 반도체 요약 =====
-(3줄 이내)
+(3줄 이내, 기사 없으면 최근 핫이슈 기반)
 
 ===== ⚡ 에너지 요약 =====
-(3줄 이내)
+(3줄 이내, 기사 없으면 최근 핫이슈 기반)
 
 ===== 📊 거시경제 요약 =====
-(3줄 이내)
+(3줄 이내, 기사 없으면 최근 핫이슈 기반)
 
 ===== 🌏 글로벌 이벤트 요약 =====
-(3줄 이내)
+(3줄 이내, 기사 없으면 최근 핫이슈 기반)
 
 ===== 💡 오늘의 투자 인사이트 =====
 (종목별 대응 방향 포함, 5줄 이내)
@@ -406,7 +508,14 @@ def build_summary(articles: List[Article], today: str) -> str:
 
     category_summary = gemini_summarize(category_summary_prompt)
 
-    return f"{category_summary}\n\n{'='*60}\n\n📋 기사별 상세 분석\n\n{'='*60}\n\n{per_article_analysis}"
+    # 핫이슈 섹션이 있으면 마지막에 별도 첨부
+    hot_appendix = f"\n\n{'='*60}\n\n🔥 기사 없는 카테고리 - 최근 핫이슈 (자체 분석)\n\n{'='*60}\n\n{hot_issue_sections}" if hot_issue_sections else ""
+
+    return (
+        f"{category_summary}"
+        f"\n\n{'='*60}\n\n📋 기사별 상세 분석\n\n{'='*60}\n\n{per_article_analysis}"
+        f"{hot_appendix}"
+    )
 
 
 CATEGORY_LABEL = {
