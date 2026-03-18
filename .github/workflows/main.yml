@@ -31,6 +31,7 @@ jobs:
           KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
           KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
           KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          GITHUB_BRANCH: gh-pages
           MAX_ARTICLES: ${{ secrets.MAX_ARTICLES }}
         run: |
           python app.py
