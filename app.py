@@ -81,125 +81,227 @@ NAVER_NEWSPAPER_RSS = [
     ("https://www.sedaily.com/RSS/economic.xml", "macro"),
 ]
 
+FALLBACK_TOPICS_PROMPT = """오늘은 {today}입니다.
+수집된 뉴스가 없습니다. 아래 보유 종목과 관련된 오늘 날짜 기준 주요 이슈 및 투자 인사이트를 직접 분석해주세요.
 
-def _env(name: str, default: Optional[str] = None) -> str:
-    val = os.getenv(name, default)
-    if val is None or val.strip() == "":
-        raise RuntimeError(f"Missing env: {name}")
+보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
+
+다음 카테고리별로 최신 동향과 투자 인사이트를 작성해주세요:
+- 반도체: AI 반도체 수요, 메모리 가격 동향, 주요 기업 실적
+- 에너지: 원전 정책, LNG 가격, 재생에너지 동향
+- 거시경제: 금리 정책, 환율, 무역 이슈
+- 글로벌 이벤트: 지정학적 리스크, 주요 이벤트
+
+마지막에 오늘의 투자 인사이트를 종목별로 정리해주세요.
+"""
+
+
+# ── 헬퍼 함수 ────────────────────────────────────────────────
+def _env(key: str) -> str:
+    """환경 변수를 읽어옵니다. 없으면 RuntimeError."""
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(f"환경 변수 '{key}'가 설정되지 않았습니다. .env 파일을 확인하세요.")
     return val
 
 
-def _env_optional(name: str) -> Optional[str]:
-    val = os.getenv(name)
-    return val.strip() if val and val.strip() else None
+def _env_str(key: str, default: str = "") -> str:
+    """환경 변수를 읽어옵니다. 없으면 default 반환."""
+    return os.getenv(key, default)
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    return int(raw.strip()) if raw and raw.strip() else default
-
-
-def _env_str(name: str, default: str) -> str:
-    raw = os.getenv(name)
-    return raw.strip() if raw and raw.strip() else default
-
-
-def fetch_google_rss(query: str) -> List[dict]:
-    """구글 뉴스 RSS로 해외 기사 수집"""
-    url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en&gl=US&ceid=US:en"
+def _env_int(key: str, default: int = 0) -> int:
+    """환경 변수를 정수로 읽어옵니다. 없으면 default 반환."""
+    val = os.getenv(key)
+    if val is None:
+        return default
     try:
-        feed = feedparser.parse(url)
-        return getattr(feed, "entries", [])
-    except Exception as e:
-        print(f"[Google RSS] 실패 ({query}): {e}")
-        return []
+        return int(val)
+    except ValueError:
+        return default
 
 
-def fetch_naver_news(query: str) -> List[dict]:
-    """네이버 뉴스 API로 국내 기사 수집"""
-    client_id = _env_optional("NAVER_CLIENT_ID")
-    client_secret = _env_optional("NAVER_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        return []
+# ── 기사 본문 추출 ───────────────────────────────────────────
+def fetch_article_text(url: str, max_chars: int = 1500) -> str:
+    """URL에서 기사 본문을 추출합니다."""
     try:
-        r = requests.get(
-            "https://openapi.naver.com/v1/search/news.json",
-            headers={
-                "X-Naver-Client-Id": client_id,
-                "X-Naver-Client-Secret": client_secret,
-            },
-            params={"query": query, "display": 5, "sort": "date"},
-            timeout=15,
+        resp = requests.get(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=10,
         )
-        return r.json().get("items", [])
-    except Exception as e:
-        print(f"[Naver] 실패 ({query}): {e}")
-        return []
-
-
-def fetch_newspaper_rss(rss_url: str) -> List[dict]:
-    """신문사 RSS 수집"""
-    try:
-        feed = feedparser.parse(rss_url)
-        return getattr(feed, "entries", []) if not getattr(feed, "bozo", 0) else []
-    except Exception as e:
-        print(f"[RSS] 실패 ({rss_url}): {e}")
-        return []
-
-
-def extract_article_text(url: str) -> str:
-    try:
-        r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
-        doc = Document(r.text)
+        resp.raise_for_status()
+        doc = Document(resp.text)
         soup = BeautifulSoup(doc.summary(), "html.parser")
-        return soup.get_text("\n", strip=True)[:5000]
+        text = soup.get_text(separator=" ", strip=True)
+        return text[:max_chars]
     except Exception as e:
-        print(f"[extract] 실패 ({url}): {e}")
+        print(f"  [본문 추출 실패] {url}: {e}")
         return ""
 
 
-def collect_articles(max_articles: int) -> List[Article]:
-    raw: List[tuple] = []  # (title, url, category, source)
-    seen_urls: set = set()
+# ── 구글 뉴스 RSS 수집 ───────────────────────────────────────
+def collect_google_rss(max_per_query: int = 3) -> List[Article]:
+    """Google News RSS에서 기사를 수집합니다."""
+    articles: List[Article] = []
+    idx = 0
 
-    # 1) 구글 RSS (해외)
     for query, category in GOOGLE_RSS_QUERIES:
-        for e in fetch_google_rss(query)[:3]:
-            url = (e.get("link") or "").strip()
-            title = re.sub(r"<[^>]+>", "", e.get("title") or "").strip()
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                raw.append((title, url, category, urlparse(url).netloc, e.get("published", "")))
+        encoded_query = quote(query)
+        rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=en&gl=US&ceid=US:en"
+        try:
+            feed = feedparser.parse(rss_url)
+            for entry in feed.entries[:max_per_query]:
+                title = entry.get("title", "").strip()
+                url = entry.get("link", "").strip()
+                published = entry.get("published", "")
+                source = urlparse(url).netloc.replace("www.", "")
 
-    # 2) 네이버 뉴스 API
-    for query, category in NAVER_QUERIES:
-        for item in fetch_naver_news(query):
-            url = (item.get("originallink") or item.get("link") or "").strip()
-            title = re.sub(r"<[^>]+>", "", item.get("title") or "").strip()
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                raw.append((title, url, category, urlparse(url).netloc, item.get("pubDate", "")))
+                if not title or not url:
+                    continue
 
-    # 3) 신문사 RSS
-    for rss_url, category in NAVER_NEWSPAPER_RSS:
-        for e in fetch_newspaper_rss(rss_url)[:3]:
-            url = (e.get("link") or "").strip()
-            title = re.sub(r"<[^>]+>", "", e.get("title") or "").strip()
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                raw.append((title, url, category, urlparse(url).netloc, e.get("published", "")))
+                text = fetch_article_text(url)
+                articles.append(Article(
+                    idx=idx,
+                    title=title,
+                    url=url,
+                    source=source,
+                    published=published,
+                    text=text,
+                    category=category,
+                ))
+                idx += 1
+                print(f"  [Google RSS] {category} | {title[:50]}")
+        except Exception as e:
+            print(f"  [Google RSS 실패] {query}: {e}")
 
-    # 본문 추출 후 Article 생성
-    articles = []
-    for idx, (title, url, category, source, published) in enumerate(raw[:max_articles]):
-        text = extract_article_text(url)
-        if title:
-            articles.append(Article(
-                idx=idx, title=title, url=url,
-                source=source, published=published,
-                text=text, category=category,
-            ))
     return articles
+
+
+# ── 네이버 뉴스 검색 수집 ────────────────────────────────────
+def collect_naver_search(max_per_query: int = 3) -> List[Article]:
+    """네이버 뉴스 검색 API로 기사를 수집합니다."""
+    articles: List[Article] = []
+    idx = 10000  # 구글 RSS와 idx 충돌 방지
+
+    client_id = os.getenv("NAVER_CLIENT_ID")
+    client_secret = os.getenv("NAVER_CLIENT_SECRET")
+
+    if not client_id or not client_secret:
+        print("  [네이버 API] 키 미설정, 네이버 검색 건너뜀")
+        return articles
+
+    headers = {
+        "X-Naver-Client-Id": client_id,
+        "X-Naver-Client-Secret": client_secret,
+    }
+
+    for query, category in NAVER_QUERIES:
+        try:
+            resp = requests.get(
+                "https://openapi.naver.com/v1/search/news.json",
+                headers=headers,
+                params={"query": query, "display": max_per_query, "sort": "date"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", [])
+            for item in items:
+                title = BeautifulSoup(item.get("title", ""), "html.parser").get_text()
+                url = item.get("originallink") or item.get("link", "")
+                published = item.get("pubDate", "")
+                source = urlparse(url).netloc.replace("www.", "")
+                description = BeautifulSoup(item.get("description", ""), "html.parser").get_text()
+
+                if not title or not url:
+                    continue
+
+                # 본문 추출 시도, 실패하면 description 사용
+                text = fetch_article_text(url) or description
+
+                articles.append(Article(
+                    idx=idx,
+                    title=title,
+                    url=url,
+                    source=source,
+                    published=published,
+                    text=text,
+                    category=category,
+                ))
+                idx += 1
+                print(f"  [Naver Search] {category} | {title[:50]}")
+        except Exception as e:
+            print(f"  [Naver Search 실패] {query}: {e}")
+
+    return articles
+
+
+# ── 네이버 신문사 RSS 수집 ───────────────────────────────────
+def collect_naver_newspaper_rss(max_per_feed: int = 5) -> List[Article]:
+    """네이버 주요 신문사 RSS에서 기사를 수집합니다."""
+    articles: List[Article] = []
+    idx = 20000  # 다른 수집원과 idx 충돌 방지
+
+    for rss_url, category in NAVER_NEWSPAPER_RSS:
+        try:
+            feed = feedparser.parse(rss_url)
+            source = urlparse(rss_url).netloc.replace("www.", "").replace("rss.", "")
+            for entry in feed.entries[:max_per_feed]:
+                title = entry.get("title", "").strip()
+                url = entry.get("link", "").strip()
+                published = entry.get("published", "")
+
+                if not title or not url:
+                    continue
+
+                text = fetch_article_text(url)
+                articles.append(Article(
+                    idx=idx,
+                    title=title,
+                    url=url,
+                    source=source,
+                    published=published,
+                    text=text,
+                    category=category,
+                ))
+                idx += 1
+                print(f"  [Newspaper RSS] {category} | {title[:50]}")
+        except Exception as e:
+            print(f"  [Newspaper RSS 실패] {rss_url}: {e}")
+
+    return articles
+
+
+# ── 중복 제거 ────────────────────────────────────────────────
+def deduplicate(articles: List[Article]) -> List[Article]:
+    """URL 기준으로 중복 기사를 제거합니다."""
+    seen_urls: set = set()
+    result: List[Article] = []
+    for a in articles:
+        if a.url not in seen_urls:
+            seen_urls.add(a.url)
+            result.append(a)
+    return result
+
+
+# ── 전체 수집 진입점 ─────────────────────────────────────────
+def collect_articles(max_articles: int = 60) -> List[Article]:
+    """모든 소스에서 기사를 수집하고 중복을 제거합니다."""
+    all_articles: List[Article] = []
+
+    print("[1/3] 구글 뉴스 RSS 수집 중...")
+    all_articles += collect_google_rss(max_per_query=3)
+
+    print("[2/3] 네이버 뉴스 검색 수집 중...")
+    all_articles += collect_naver_search(max_per_query=3)
+
+    print("[3/3] 네이버 신문사 RSS 수집 중...")
+    all_articles += collect_naver_newspaper_rss(max_per_feed=5)
+
+    all_articles = deduplicate(all_articles)
+    print(f"[중복 제거 후] {len(all_articles)}개")
+
+    return all_articles[:max_articles]
 
 
 def gemini_summarize(prompt: str) -> str:
@@ -214,24 +316,46 @@ def gemini_summarize(prompt: str) -> str:
 
 def build_summary(articles: List[Article], today: str) -> str:
     if not articles:
-        return "오늘 수집된 뉴스가 없습니다."
+        prompt = FALLBACK_TOPICS_PROMPT.format(today=today)
+        return gemini_summarize(prompt)
 
     def fmt(cat: str) -> str:
-        return "\n".join(
-            f"- [{a.source}] {a.title}\n  {a.text[:800]}"
-            for a in articles if a.category == cat
-        ) or "해당 없음"
+        cat_articles = [a for a in articles if a.category == cat]
+        if cat_articles:
+            return "\n".join(
+                f"- [{a.source}] {a.title}\n  {a.text[:800]}"
+                for a in cat_articles
+            )
+        return f"[수집된 기사 없음 - 해당 분야 최신 동향을 {today} 기준으로 직접 분석해주세요]"
 
-    prompt = f"""오늘은 {today}입니다. 아래는 카테고리별로 수집된 뉴스입니다.
+    # ── 1단계: 기사별 심층 분석 ──────────────────────────────
+    per_article_prompt = f"""오늘은 {today}입니다.
+아래 기사들을 **각각 개별적으로** 분석해주세요.
 
-투자자 관점에서 다음 조건에 맞게 한국어로 분석해주세요:
-1. 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
-2. 영어 기사는 한국어로 번역하여 요약
-3. 비슷한 내용의 기사는 묶어서 정리
-4. 각 카테고리별 핵심 내용 3줄 이내 요약
-5. 보유 종목에 미칠 영향 분석 (긍정/부정/중립)
-6. 오늘의 투자 인사이트 (전체 종합)
-7. 글로벌 이벤트(전쟁, 감염병 등)가 있다면 보유 종목과의 연관성 분석
+분석 조건:
+- 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
+- 영어 기사는 한국어로 번역
+
+**날짜 및 중요도 우선순위 규칙 (반드시 준수)**
+- 오늘({today}) 발행된 기사를 최우선으로 다루세요.
+- 어제 날짜 기사는 오늘 기사가 충분하지 않거나, 해당 카테고리에서 대체할 만한
+  오늘 기사가 없을 경우에만 포함하세요.
+- 그보다 오래된 기사는 시장에 현재진행형으로 영향을 미치는 경우가 아니라면 제외하세요.
+- 오래된 기사를 포함할 경우 "(전일 이슈 지속)" 또는 "(n일 전)" 등으로 명시해주세요.
+
+**서술 방식**
+- 기사마다 제목을 먼저 쓰고, 아래 항목 중 해당되는 것만 자연스럽게 서술해주세요.
+  억지로 모든 항목을 채우지 말고, 기사 내용에 따라 깊이와 항목을 유연하게 조절하세요.
+  - 무슨 일이 일어났는지
+  - 관련 이해관계자들의 입장 (있을 경우: 예- 노사갈등, 정책 찬반, 기업간 분쟁 등)
+  - 왜 이 이슈가 중요한지 / 배경
+  - 앞으로 어떻게 흘러갈지 전망
+  - 보유 종목 중 해당 종목이 있다면 영향도 (긍정/부정/중립 + 이유)
+- 단순 수치 발표나 단신이라면 2~3줄로 간결하게 마무리해도 됩니다.
+- 노사갈등, 정책 변화, 대형 계약, 실적 서프라이즈처럼 파급력이 큰 이슈는
+  배경·입장·전망을 충분히 서술해주세요.
+- 기사가 없는 카테고리는 {today} 기준 해당 분야에서 가장 주목할 만한 이슈나
+  잠재 리스크를 자체 판단하여 작성해주세요.
 
 ===== 반도체 =====
 {fmt("semiconductor")}
@@ -245,7 +369,44 @@ def build_summary(articles: List[Article], today: str) -> str:
 ===== 글로벌 이벤트 =====
 {fmt("global_event")}
 """
-    return gemini_summarize(prompt)
+
+    per_article_analysis = gemini_summarize(per_article_prompt)
+
+    # ── 2단계: 카테고리별 종합 요약 + 투자 인사이트 ──────────
+    category_summary_prompt = f"""오늘은 {today}입니다.
+아래는 오늘 수집된 뉴스의 기사별 심층 분석 결과입니다.
+
+이를 바탕으로 **카테고리별 종합 요약**과 **투자 인사이트**를 작성해주세요.
+
+작성 조건:
+- 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
+- 비슷한 기사는 묶어서 중복 없이 정리
+- 각 카테고리 3줄 이내 핵심 요약
+- 마지막에 오늘의 투자 인사이트 (전체 종합, 종목별 대응 방향 포함)
+
+출력 형식:
+===== 💾 반도체 요약 =====
+(3줄 이내)
+
+===== ⚡ 에너지 요약 =====
+(3줄 이내)
+
+===== 📊 거시경제 요약 =====
+(3줄 이내)
+
+===== 🌏 글로벌 이벤트 요약 =====
+(3줄 이내)
+
+===== 💡 오늘의 투자 인사이트 =====
+(종목별 대응 방향 포함, 5줄 이내)
+
+--- 기사별 분석 원문 ---
+{per_article_analysis}
+"""
+
+    category_summary = gemini_summarize(category_summary_prompt)
+
+    return f"{category_summary}\n\n{'='*60}\n\n📋 기사별 상세 분석\n\n{'='*60}\n\n{per_article_analysis}"
 
 
 CATEGORY_LABEL = {
