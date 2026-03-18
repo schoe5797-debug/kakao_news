@@ -44,4 +44,4 @@ jobs:
           git config --global user.email "github-actions@github.com"
           git add index.html
           git commit -m "Update daily news page" || echo "No changes"
-          git push
+          git push origin HEAD:gh-pages
