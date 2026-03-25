@@ -2,9 +2,11 @@ import html as ihtml
 import json
 import os
 import re
-from dataclasses import dataclass, field
+import time
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from urllib.parse import urlparse, quote
 
 import feedparser
@@ -14,6 +16,7 @@ from dotenv import load_dotenv
 from readability import Document
 
 
+# ── Article 데이터클래스 ─────────────────────────────────────
 @dataclass(frozen=True)
 class Article:
     idx: int
@@ -21,54 +24,84 @@ class Article:
     url: str
     source: str
     published: str
-    published_dt: datetime          # ★ 파싱된 datetime (정렬·필터용)
+    published_dt: datetime        # 파싱된 datetime (정렬·필터용)
     text: str
-    category: str  # 'semiconductor' | 'energy' | 'macro' | 'global_event'
+    category: str                 # semiconductor | energy | auto | macro | global_event | ai
+    is_critical: bool = False     # 리스크 신호어 감지 여부
+    critical_signal: str = ""     # 어떤 신호어에 걸렸는지
 
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+)
 KST = timezone(timedelta(hours=9))
+MAX_AGE_SECONDS = int(os.getenv("MAX_AGE_HOURS", "24")) * 3600
 
-# ── 구글 RSS (해외) ──────────────────────────────────────────
+
+# ── 구글 RSS 쿼리 (종목 직접 연관) ──────────────────────────
 GOOGLE_RSS_QUERIES = [
-    ("semiconductor market", "semiconductor"),
-    ("NVIDIA stock earnings", "semiconductor"),
-    ("Samsung Electronics chip", "semiconductor"),
-    ("TSMC foundry", "semiconductor"),
-    ("AI chip demand", "semiconductor"),
-    ("nuclear energy stock", "energy"),
-    ("CEG Constellation Energy", "energy"),
-    ("Doosan Enerbility", "energy"),
-    ("LNG oil price", "energy"),
-    ("renewable energy policy", "energy"),
-    ("Federal Reserve interest rate", "macro"),
-    ("US China trade tariff", "macro"),
-    ("global inflation economy", "macro"),
-    ("Korea economy export", "macro"),
-    ("Middle East war oil", "global_event"),
-    ("geopolitical risk market", "global_event"),
-    ("pandemic outbreak disease", "global_event"),
+    # 반도체
+    ("Samsung Electronics semiconductor earnings", "semiconductor"),
+    ("Samsung Electronics memory chip HBM", "semiconductor"),
+    ("SK Hynix HBM memory", "semiconductor"),
+    ("NVIDIA stock earnings AI chip", "semiconductor"),
+    ("NVIDIA GPU data center", "semiconductor"),
+    ("WC Co semiconductor Korea", "semiconductor"),
+    ("TSMC AI chip demand foundry", "semiconductor"),
+    # 에너지
+    ("Doosan Enerbility nuclear reactor", "energy"),
+    ("Korea nuclear power plant policy", "energy"),
+    ("Constellation Energy CEG nuclear stock", "energy"),
+    ("LNG natural gas price", "energy"),
+    # 자동차부품 (한온시스템)
+    ("Hanon Systems automotive HVAC", "auto"),
+    ("Hanon Systems earnings EV thermal", "auto"),
+    ("automotive parts EV cooling supply chain", "auto"),
+    # 거시경제
+    ("Federal Reserve interest rate decision", "macro"),
+    ("US China trade tariff semiconductor", "macro"),
+    ("Korea export economy won dollar", "macro"),
+    ("Korea KOSPI foreign investor", "macro"),
+    # 글로벌 이벤트
+    ("Middle East oil geopolitical risk", "global_event"),
+    ("geopolitical risk semiconductor supply", "global_event"),
+    # AI / AGI
+    ("AGI artificial general intelligence 2025", "ai"),
+    ("OpenAI Google DeepMind AI breakthrough", "ai"),
+    ("AI regulation policy latest", "ai"),
 ]
 
-# ── 네이버 뉴스 검색 쿼리 (국내) ────────────────────────────
+# ── 네이버 뉴스 검색 쿼리 (종목 직접 연관) ──────────────────
 NAVER_QUERIES = [
-    ("삼성전자 반도체", "semiconductor"),
+    # 반도체
+    ("삼성전자 반도체 실적", "semiconductor"),
+    ("삼성전자 HBM 메모리", "semiconductor"),
     ("SK하이닉스 HBM", "semiconductor"),
-    ("엔비디아 주가", "semiconductor"),
-    ("반도체 수출 경기", "semiconductor"),
-    ("와이씨 주가", "semiconductor"),
-    ("두산에너빌리티 원전", "energy"),
-    ("한국 원자력 에너지", "energy"),
-    ("CEG 에너지 주가", "energy"),
+    ("엔비디아 주가 실적", "semiconductor"),
+    ("와이씨 반도체 주가", "semiconductor"),
+    # 에너지
+    ("두산에너빌리티 원전 수주", "energy"),
+    ("한국 원전 수출 정책", "energy"),
+    ("CEG Constellation Energy 주가", "energy"),
     ("LNG 천연가스 가격", "energy"),
-    ("한국 경제 수출 환율", "macro"),
-    ("코스피 외국인 수급", "macro"),
-    ("미국 금리 한국 영향", "macro"),
-    ("중동 전쟁 한국 경제", "global_event"),
-    ("지정학 리스크 주식", "global_event"),
+    # 자동차부품
+    ("한온시스템 주가 실적", "auto"),
+    ("한온시스템 전기차 부품", "auto"),
+    ("자동차부품 EV 열관리", "auto"),
+    # 거시경제
+    ("코스피 외국인 수급 환율", "macro"),
+    ("미국 금리 한국 증시", "macro"),
+    ("반도체 수출 무역 관세", "macro"),
+    # 글로벌 이벤트
+    ("중동 지정학 리스크 유가", "global_event"),
+    # AI / AGI
+    ("AGI 인공일반지능 최신", "ai"),
+    ("AI 인공지능 최신 뉴스", "ai"),
+    ("챗GPT 클로드 제미나이 최신", "ai"),
 ]
 
-# ── 네이버 주요 신문사 RSS ───────────────────────────────────
+# ── 네이버 신문사 RSS ────────────────────────────────────────
 NAVER_NEWSPAPER_RSS = [
     ("https://rss.hankyung.com/economy.xml", "macro"),
     ("https://rss.hankyung.com/it.xml", "semiconductor"),
@@ -78,29 +111,79 @@ NAVER_NEWSPAPER_RSS = [
     ("https://www.sedaily.com/RSS/economic.xml", "macro"),
 ]
 
+# ── 보유 종목 관련도 필터 키워드 ────────────────────────────
+STOCK_KEYWORDS = [
+    "삼성전자", "samsung electronics", "samsung",
+    "두산에너빌리티", "doosan enerbility", "doosan",
+    "와이씨", "wc co",
+    "한온시스템", "hanon systems", "hanon",
+    "엔비디아", "nvidia",
+    "ceg", "constellation energy",
+    # 종목 직접 언급 없어도 허용할 관련 키워드
+    "반도체", "semiconductor", "hbm", "ai chip", "gpu",
+    "원전", "nuclear", "lng", "천연가스",
+    "열관리", "hvac", "ev thermal", "전기차",
+    "금리", "interest rate", "환율", "kospi", "tariff", "관세",
+    "geopolit", "지정학", "유가", "oil price",
+    # AI / AGI 카테고리는 항상 통과
+    "agi", "artificial general intelligence", "openai", "deepmind",
+    "chatgpt", "claude", "gemini", "llm", "인공지능", "ai 규제",
+]
+
+# ── 리스크 신호어 ────────────────────────────────────────────
+RISK_SIGNALS = [
+    # 법적·규제
+    "소송", "제소", "기소", "벌금", "과징금", "규제", "제재",
+    "lawsuit", "indicted", "penalty", "sanction", "investigation",
+    # 인사·조직
+    "파업", "해고", "구조조정", "사퇴", "경질", "내부고발",
+    "strike", "layoff", "restructuring", "resign", "whistleblower",
+    # 보안·유출
+    "유출", "해킹", "침해", "내부자", "기밀",
+    "leak", "breach", "hacked", "espionage", "theft",
+    # 실적·재무 충격
+    "어닝쇼크", "적자전환", "하향조정", "신용등급",
+    "earnings miss", "downgrade", "credit rating", "write-off",
+    # 공급망·생산
+    "공급 차질", "생산 중단", "리콜", "결함",
+    "supply disruption", "production halt", "recall", "defect",
+    # 지정학·정책
+    "수출 규제", "블랙리스트", "거래 제한",
+    "export ban", "blacklist", "trade restriction",
+]
+
+# ── 키워드 빈도 집계 불용어 ──────────────────────────────────
+STOPWORDS = {
+    "및", "등", "위한", "대한", "관련", "통해", "따른", "기반", "있는", "있다",
+    "하는", "이후", "이번", "지난", "올해", "내년", "최근", "현재", "계속",
+    "한국", "미국", "중국", "글로벌", "시장", "기업", "투자", "주가", "뉴스",
+    "the", "a", "an", "of", "in", "to", "and", "for", "is", "on",
+    "at", "by", "with", "from", "as", "that", "this", "its", "are",
+    "will", "said", "says", "new", "year", "also", "after",
+}
+
 FALLBACK_TOPICS_PROMPT = """오늘은 {today}입니다.
 수집된 뉴스가 없습니다. 아래 보유 종목과 관련된 오늘 날짜 기준 주요 이슈 및 투자 인사이트를 직접 분석해주세요.
 
-보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
+보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 한온시스템, 엔비디아, CEG(Constellation Energy)
 
 다음 카테고리별로 최신 동향과 투자 인사이트를 작성해주세요:
 - 반도체: AI 반도체 수요, 메모리 가격 동향, 주요 기업 실적
 - 에너지: 원전 정책, LNG 가격, 재생에너지 동향
+- 자동차부품: 전기차 열관리, 한온시스템 동향
 - 거시경제: 금리 정책, 환율, 무역 이슈
 - 글로벌 이벤트: 지정학적 리스크, 주요 이벤트
+- AI/AGI: 최신 AI 기술 및 정책 동향 (3줄 이내)
 
 마지막에 오늘의 투자 인사이트를 종목별로 정리해주세요.
 """
-
-# ★ 최대 허용 시간 (초): 기본 24시간
-MAX_AGE_SECONDS = int(os.getenv("MAX_AGE_HOURS", "24")) * 3600
 
 
 # ── 헬퍼 함수 ────────────────────────────────────────────────
 def _env(key: str) -> str:
     val = os.getenv(key)
     if not val:
-        raise RuntimeError(f"환경 변수 '{key}'가 설정되지 않았습니다. .env 파일을 확인하세요.")
+        raise RuntimeError(f"환경 변수 '{key}'가 설정되지 않았습니다.")
     return val
 
 
@@ -129,7 +212,6 @@ _DATE_FORMATS = [
 
 
 def parse_published(published: str) -> Optional[datetime]:
-    """RSS published 문자열 → timezone-aware datetime (UTC)."""
     if not published:
         return None
     for fmt in _DATE_FORMATS:
@@ -144,19 +226,13 @@ def parse_published(published: str) -> Optional[datetime]:
 
 
 def age_seconds(dt: datetime, now: datetime) -> float:
-    """dt 기준 현재까지 경과 초. dt가 미래면 0 반환."""
-    diff = now - dt
-    return max(diff.total_seconds(), 0.0)
+    return max((now - dt).total_seconds(), 0.0)
 
 
 def is_recent(published_dt: Optional[datetime], now: datetime, max_age: int = MAX_AGE_SECONDS) -> bool:
-    """
-    ★ 핵심 변경점 ★
-    - published_dt가 None(파싱 실패)이면 무조건 False → 오래된 기사 차단
-    - 경과 시간이 max_age 초 이내인 기사만 True
-    """
+    """날짜 파싱 실패 시 False → 날짜 불명 기사 차단."""
     if published_dt is None:
-        return False  # 날짜 불명 → 버린다
+        return False
     return age_seconds(published_dt, now) <= max_age
 
 
@@ -167,11 +243,47 @@ def fetch_article_text(url: str, max_chars: int = 1500) -> str:
         resp.raise_for_status()
         doc = Document(resp.text)
         soup = BeautifulSoup(doc.summary(), "html.parser")
-        text = soup.get_text(separator=" ", strip=True)
-        return text[:max_chars]
+        return soup.get_text(separator=" ", strip=True)[:max_chars]
     except Exception as e:
         print(f"  [본문 추출 실패] {url}: {e}")
         return ""
+
+
+# ── 관련도 필터 ──────────────────────────────────────────────
+def is_relevant(article: Article) -> bool:
+    """AI 카테고리는 무조건 통과, 나머지는 종목 키워드 필터."""
+    if article.category == "ai":
+        return True
+    haystack = (article.title + " " + article.text).lower()
+    return any(kw.lower() in haystack for kw in STOCK_KEYWORDS)
+
+
+# ── 리스크 신호어 감지 ───────────────────────────────────────
+def detect_risk(article: Article) -> Tuple[bool, str]:
+    """리스크 신호어가 제목 또는 본문에 포함되면 (True, 신호어) 반환."""
+    haystack = (article.title + " " + article.text).lower()
+    for signal in RISK_SIGNALS:
+        if signal.lower() in haystack:
+            return True, signal
+    return False, ""
+
+
+# ── 키워드 빈도 집계 ─────────────────────────────────────────
+def extract_top_keywords(articles: List[Article], top_n: int = 10) -> List[Tuple[str, int]]:
+    """제목(가중치 3배) + 본문에서 자주 등장하는 키워드 top_n개 반환."""
+    counter: Counter = Counter()
+    for a in articles:
+        text = (a.title + " ") * 3 + a.text
+        words = re.findall(r"[가-힣]{2,}|[A-Za-z]{3,}", text)
+        for w in words:
+            wl = w.lower()
+            if wl not in STOPWORDS:
+                counter[wl] += 1
+    return counter.most_common(top_n)
+
+
+def format_keywords(keywords: List[Tuple[str, int]]) -> str:
+    return ", ".join(f"{kw}({cnt}회)" for kw, cnt in keywords)
 
 
 # ── 구글 뉴스 RSS 수집 ───────────────────────────────────────
@@ -181,15 +293,15 @@ def collect_google_rss(max_per_query: int = 3, now: Optional[datetime] = None) -
     if now is None:
         now = datetime.now(timezone.utc)
 
-    # ★ Google RSS: when=1d 파라미터로 최근 24시간 기사만 요청
     for query, category in GOOGLE_RSS_QUERIES:
         encoded_query = quote(query)
+        # when:1d + ts= 로 캐시 우회
         rss_url = (
             f"https://news.google.com/rss/search"
-            f"?q={encoded_query}+when:1d&hl=en&gl=US&ceid=US:en"
+            f"?q={encoded_query}+when:1d&hl=en&gl=US&ceid=US:en&ts={int(time.time())}"
         )
         try:
-            feed = feedparser.parse(rss_url)
+            feed = feedparser.parse(rss_url, etag=None, modified=None)
             collected = 0
             for entry in feed.entries:
                 if collected >= max_per_query:
@@ -203,32 +315,36 @@ def collect_google_rss(max_per_query: int = 3, now: Optional[datetime] = None) -
                     continue
 
                 published_dt = parse_published(published)
-
-                # ★ 날짜 파싱 실패 or 24시간 초과 → 버린다
                 if not is_recent(published_dt, now):
                     age_str = f"{age_seconds(published_dt, now)/3600:.1f}h ago" if published_dt else "날짜불명"
                     print(f"  [Google RSS 스킵] {age_str} | {title[:40]}")
                     continue
 
                 text = fetch_article_text(url)
+                is_crit, signal = detect_risk_from_raw(title, text)
                 articles.append(Article(
-                    idx=idx,
-                    title=title,
-                    url=url,
-                    source=source,
-                    published=published,
-                    published_dt=published_dt,
-                    text=text,
-                    category=category,
+                    idx=idx, title=title, url=url, source=source,
+                    published=published, published_dt=published_dt,
+                    text=text, category=category,
+                    is_critical=is_crit, critical_signal=signal,
                 ))
                 idx += 1
                 collected += 1
+                flag = "⚠️" if is_crit else "✓"
                 age_h = age_seconds(published_dt, now) / 3600
-                print(f"  [Google RSS ✓] {age_h:.1f}h ago | {category} | {title[:45]}")
+                print(f"  [Google RSS {flag}] {age_h:.1f}h ago | {category} | {title[:45]}")
         except Exception as e:
             print(f"  [Google RSS 실패] {query}: {e}")
 
     return articles
+
+
+def detect_risk_from_raw(title: str, text: str) -> Tuple[bool, str]:
+    haystack = (title + " " + text).lower()
+    for signal in RISK_SIGNALS:
+        if signal.lower() in haystack:
+            return True, signal
+    return False, ""
 
 
 # ── 네이버 뉴스 검색 수집 ────────────────────────────────────
@@ -240,29 +356,23 @@ def collect_naver_search(max_per_query: int = 3, now: Optional[datetime] = None)
 
     client_id = os.getenv("NAVER_CLIENT_ID")
     client_secret = os.getenv("NAVER_CLIENT_SECRET")
-
     if not client_id or not client_secret:
         print("  [네이버 API] 키 미설정, 건너뜀")
         return articles
 
-    headers = {
-        "X-Naver-Client-Id": client_id,
-        "X-Naver-Client-Secret": client_secret,
-    }
+    headers = {"X-Naver-Client-Id": client_id, "X-Naver-Client-Secret": client_secret}
 
     for query, category in NAVER_QUERIES:
         try:
-            # ★ 넉넉히 가져오고 파이썬에서 엄격히 필터
             resp = requests.get(
                 "https://openapi.naver.com/v1/search/news.json",
-                headers=headers,
+                headers={**headers, "Cache-Control": "no-cache"},
                 params={"query": query, "display": max_per_query * 5, "sort": "date"},
                 timeout=10,
             )
             resp.raise_for_status()
-            items = resp.json().get("items", [])
             collected = 0
-            for item in items:
+            for item in resp.json().get("items", []):
                 if collected >= max_per_query:
                     break
                 title = BeautifulSoup(item.get("title", ""), "html.parser").get_text()
@@ -275,27 +385,24 @@ def collect_naver_search(max_per_query: int = 3, now: Optional[datetime] = None)
                     continue
 
                 published_dt = parse_published(published)
-
                 if not is_recent(published_dt, now):
                     age_str = f"{age_seconds(published_dt, now)/3600:.1f}h ago" if published_dt else "날짜불명"
                     print(f"  [Naver 스킵] {age_str} | {title[:40]}")
                     continue
 
                 text = fetch_article_text(url) or description
+                is_crit, signal = detect_risk_from_raw(title, text)
                 articles.append(Article(
-                    idx=idx,
-                    title=title,
-                    url=url,
-                    source=source,
-                    published=published,
-                    published_dt=published_dt,
-                    text=text,
-                    category=category,
+                    idx=idx, title=title, url=url, source=source,
+                    published=published, published_dt=published_dt,
+                    text=text, category=category,
+                    is_critical=is_crit, critical_signal=signal,
                 ))
                 idx += 1
                 collected += 1
+                flag = "⚠️" if is_crit else "✓"
                 age_h = age_seconds(published_dt, now) / 3600
-                print(f"  [Naver ✓] {age_h:.1f}h ago | {category} | {title[:45]}")
+                print(f"  [Naver {flag}] {age_h:.1f}h ago | {category} | {title[:45]}")
         except Exception as e:
             print(f"  [Naver Search 실패] {query}: {e}")
 
@@ -325,78 +432,72 @@ def collect_naver_newspaper_rss(max_per_feed: int = 5, now: Optional[datetime] =
                     continue
 
                 published_dt = parse_published(published)
-
                 if not is_recent(published_dt, now):
                     age_str = f"{age_seconds(published_dt, now)/3600:.1f}h ago" if published_dt else "날짜불명"
                     print(f"  [Newspaper 스킵] {age_str} | {title[:40]}")
                     continue
 
                 text = fetch_article_text(url)
+                is_crit, signal = detect_risk_from_raw(title, text)
                 articles.append(Article(
-                    idx=idx,
-                    title=title,
-                    url=url,
-                    source=source,
-                    published=published,
-                    published_dt=published_dt,
-                    text=text,
-                    category=category,
+                    idx=idx, title=title, url=url, source=source,
+                    published=published, published_dt=published_dt,
+                    text=text, category=category,
+                    is_critical=is_crit, critical_signal=signal,
                 ))
                 idx += 1
                 collected += 1
+                flag = "⚠️" if is_crit else "✓"
                 age_h = age_seconds(published_dt, now) / 3600
-                print(f"  [Newspaper ✓] {age_h:.1f}h ago | {category} | {title[:45]}")
+                print(f"  [Newspaper {flag}] {age_h:.1f}h ago | {category} | {title[:45]}")
         except Exception as e:
             print(f"  [Newspaper RSS 실패] {rss_url}: {e}")
 
     return articles
 
 
-# ── 중복 제거 + 최신순 정렬 ─────────────────────────────────
+# ── 중복 제거 + 관련도 필터 + 최신순 정렬 ───────────────────
 def deduplicate_and_sort(articles: List[Article]) -> List[Article]:
-    """URL 기준 중복 제거 후 최신 기사가 먼저 오도록 정렬."""
     seen: set = set()
     unique: List[Article] = []
     for a in articles:
         if a.url not in seen:
             seen.add(a.url)
             unique.append(a)
-    # ★ 최신순 정렬: published_dt 내림차순
-    unique.sort(key=lambda a: a.published_dt, reverse=True)
+    # 관련도 필터
+    before = len(unique)
+    unique = [a for a in unique if is_relevant(a)]
+    print(f"[관련도 필터] {before}개 → {len(unique)}개")
+    # 리스크 기사 먼저, 그 다음 최신순
+    unique.sort(key=lambda a: (not a.is_critical, -a.published_dt.timestamp()))
     return unique
 
 
-# ── 전체 수집 진입점 ─────────────────────────────────────────
+# ── 전체 수집 ────────────────────────────────────────────────
 def collect_articles(max_articles: int = 60) -> List[Article]:
-    now = datetime.now(timezone.utc)  # ★ 단일 기준 시각
-
+    now = datetime.now(timezone.utc)
     print(f"[기준 시각] {now.astimezone(KST).strftime('%Y-%m-%d %H:%M')} KST")
     print(f"[필터 기준] {MAX_AGE_SECONDS // 3600}시간 이내 기사만 수집")
 
     all_articles: List[Article] = []
-
     print("[1/3] 구글 뉴스 RSS 수집 중...")
     all_articles += collect_google_rss(max_per_query=3, now=now)
-
     print("[2/3] 네이버 뉴스 검색 수집 중...")
     all_articles += collect_naver_search(max_per_query=3, now=now)
-
     print("[3/3] 네이버 신문사 RSS 수집 중...")
     all_articles += collect_naver_newspaper_rss(max_per_feed=5, now=now)
 
-    all_articles = deduplicate_and_sort(all_articles)  # ★ 최신순 정렬 포함
+    all_articles = deduplicate_and_sort(all_articles)
     print(f"[중복 제거·정렬 후] {len(all_articles)}개")
 
-    # ★ 수집 결과 요약 출력
-    if all_articles:
-        oldest = all_articles[-1]
-        newest = all_articles[0]
-        print(f"  최신: {newest.published_dt.astimezone(KST).strftime('%H:%M')} KST | {newest.title[:40]}")
-        print(f"  최구: {oldest.published_dt.astimezone(KST).strftime('%H:%M')} KST | {oldest.title[:40]}")
+    critical_count = sum(1 for a in all_articles if a.is_critical)
+    if critical_count:
+        print(f"[⚠️ 리스크 기사] {critical_count}개 감지")
 
     return all_articles[:max_articles]
 
 
+# ── Gemini 호출 ──────────────────────────────────────────────
 def gemini_summarize(prompt: str) -> str:
     from google import genai
     client = genai.Client(api_key=_env("GEMINI_API_KEY"))
@@ -407,106 +508,145 @@ def gemini_summarize(prompt: str) -> str:
     return (getattr(resp, "text", "")).strip()
 
 
+# ── 요약 생성 ────────────────────────────────────────────────
 def build_summary(articles: List[Article], today: str) -> str:
     if not articles:
-        prompt = FALLBACK_TOPICS_PROMPT.format(today=today)
-        return gemini_summarize(prompt)
+        return gemini_summarize(FALLBACK_TOPICS_PROMPT.format(today=today))
 
-    CATEGORIES = ["semiconductor", "energy", "macro", "global_event"]
+    CATEGORIES = ["semiconductor", "energy", "auto", "macro", "global_event"]
     filled = {cat for cat in CATEGORIES if any(a.category == cat for a in articles)}
     empty  = [cat for cat in CATEGORIES if cat not in filled]
 
     CATEGORY_KR = {
         "semiconductor": "반도체",
         "energy": "에너지",
+        "auto": "자동차부품(한온시스템)",
         "macro": "거시경제",
         "global_event": "글로벌 이벤트",
+        "ai": "AI/AGI",
     }
+
+    # ── AI/AGI 기사 별도 추출 ────────────────────────────────
+    ai_articles = [a for a in articles if a.category == "ai"]
 
     def fmt(cat: str) -> str:
         cat_articles = [a for a in articles if a.category == cat]
-        if cat_articles:
-            return "\n".join(
-                # ★ 발행 시각도 함께 표시해서 Gemini가 최신 기사임을 인지하게
-                f"- [{a.source} | {a.published_dt.astimezone(KST).strftime('%H:%M KST')}] {a.title}\n  {a.text[:800]}"
-                for a in cat_articles
-            )
-        return ""
+        return "\n".join(
+            f"- [{'⚠️ ' + a.critical_signal if a.is_critical else a.source} | "
+            f"{a.published_dt.astimezone(KST).strftime('%H:%M KST')}] {a.title}\n  {a.text[:800]}"
+            for a in cat_articles
+        ) if cat_articles else ""
 
+    # ── 빈 카테고리 핫이슈 ───────────────────────────────────
     hot_issue_sections = ""
     if empty:
         empty_kr = ", ".join(CATEGORY_KR[c] for c in empty)
-        hot_issue_prompt = f"""오늘은 {today}입니다.
-아래 카테고리에 대해 오늘 날짜({today}) 기준으로 **최근 며칠 사이 뉴스에 가장 많이 등장한 기업 이슈 또는 시장 이슈**를 카테고리별로 요약해주세요.
+        hot_issue_sections = gemini_summarize(f"""오늘은 {today}입니다.
+아래 카테고리에 대해 오늘 날짜 기준 최근 며칠 사이 가장 화제가 된 이슈를 카테고리별로 요약해주세요.
 
 조건:
-- 보유 종목 우선 언급: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
-- 보유 종목 이슈가 없다면 해당 분야에서 가장 화제가 된 기업/이슈를 대신 소개
+- 보유 종목 우선 언급: 삼성전자, 와이씨, 두산에너빌리티, 한온시스템, 엔비디아, CEG
 - 각 카테고리 3~5줄 이내
-- 출처가 불분명한 내용은 "추정" 또는 "알려진 바에 따르면" 등으로 표현
+- 출처 불분명 시 "추정" 또는 "알려진 바에 따르면" 표현
 
-요약이 필요한 카테고리: {empty_kr}
+카테고리: {empty_kr}
 
-각 카테고리 형식:
+형식:
 ===== [카테고리명] 최근 핫이슈 (자체 분석) =====
 (내용)
-"""
-        hot_issue_sections = gemini_summarize(hot_issue_prompt)
+""")
 
+    # ── 키워드 빈도 집계 ─────────────────────────────────────
+    top_keywords = extract_top_keywords(articles, top_n=10)
+    keyword_str = format_keywords(top_keywords)
+    print(f"[상위 키워드] {keyword_str}")
+
+    # ── 리스크 기사 블록 ─────────────────────────────────────
+    critical_articles = [a for a in articles if a.is_critical]
+    critical_block = ""
+    if critical_articles:
+        critical_block = "\n".join(
+            f"[⚠️ '{a.critical_signal}' 감지 | {a.published_dt.astimezone(KST).strftime('%H:%M KST')}] "
+            f"{a.title}\n{a.text[:800]}"
+            for a in critical_articles
+        )
+
+    # ── AI/AGI 블록 ──────────────────────────────────────────
+    ai_block = ""
+    if ai_articles:
+        ai_block = "\n".join(
+            f"- [{a.source} | {a.published_dt.astimezone(KST).strftime('%H:%M KST')}] {a.title}\n  {a.text[:600]}"
+            for a in ai_articles
+        )
+
+    # ── 일반 기사 블록 ───────────────────────────────────────
+    normal_articles = [a for a in articles if not a.is_critical and a.category != "ai"]
     article_blocks = "\n\n".join(
         f"===== {CATEGORY_KR[cat]} =====\n{fmt(cat)}"
-        for cat in CATEGORIES
-        if cat in filled
+        for cat in CATEGORIES if cat in filled
     )
 
+    # ── 1단계: 기사별 심층 분석 ──────────────────────────────
     per_article_prompt = f"""오늘은 {today}입니다.
-아래 기사들은 **모두 최근 24시간 이내** 발행된 기사입니다. 각각 개별적으로 분석해주세요.
+아래 기사들은 모두 최근 24시간 이내 발행된 기사입니다.
+
+오늘 기사 전반 상위 키워드: {keyword_str}
 
 분석 조건:
-- 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
+- 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 한온시스템, 엔비디아, CEG(Constellation Energy)
 - 영어 기사는 한국어로 번역
-- 기사 제목 옆에 발행 시각([HH:MM KST])을 표시해주세요
+- 기사 제목 옆에 발행 시각([HH:MM KST])을 표시
 
-**서술 방식**
-- 기사마다 제목과 시각을 먼저 쓰고, 아래 항목 중 해당되는 것만 자연스럽게 서술하세요.
-  - 무슨 일이 일어났는지
-  - 관련 이해관계자들의 입장 (있을 경우)
-  - 왜 이 이슈가 중요한지 / 배경
-  - 앞으로 어떻게 흘러갈지 전망
-  - 보유 종목 영향도 (긍정/부정/중립 + 이유)
-- 단순 수치 발표나 단신이라면 2~3줄로 간결하게 마무리해도 됩니다.
+{"⚠️⚠️ 아래는 중대 이슈 신호어가 감지된 기사입니다. 최우선으로 상세 분석하세요:" + chr(10) + critical_block + chr(10) + "---" if critical_block else ""}
 
+일반 기사:
 {article_blocks}
 """
-
     per_article_analysis = gemini_summarize(per_article_prompt)
 
+    # ── AI/AGI 3줄 요약 ──────────────────────────────────────
+    ai_summary = ""
+    if ai_block:
+        ai_summary = gemini_summarize(f"""오늘은 {today}입니다.
+아래 AI/AGI 관련 기사들을 **딱 3줄**로 핵심만 요약해주세요.
+투자자 관점에서 중요한 내용 위주로 작성해주세요.
+
+{ai_block}
+""")
+    else:
+        ai_summary = gemini_summarize(f"""오늘은 {today}입니다.
+오늘 날짜 기준 AI/AGI 분야의 가장 중요한 최신 소식을 **딱 3줄**로 요약해주세요.
+투자자 관점에서 중요한 내용 위주로 작성해주세요.
+""")
+
+    # ── 2단계: 카테고리 종합 요약 + 투자 인사이트 ───────────
     hot_section_note = ""
     if hot_issue_sections:
         empty_kr = ", ".join(CATEGORY_KR[c] for c in empty)
-        hot_section_note = f"""
-※ [{empty_kr}] 카테고리는 오늘 수집된 기사가 없어 최근 핫이슈로 대체합니다:
+        hot_section_note = f"\n※ [{empty_kr}] 카테고리는 수집 기사 없어 최근 핫이슈로 대체:\n{hot_issue_sections}\n"
 
-{hot_issue_sections}
-"""
-
-    category_summary_prompt = f"""오늘은 {today}입니다.
-아래는 오늘 수집된 뉴스의 기사별 심층 분석 결과입니다 (모두 24시간 이내 기사).
+    category_summary = gemini_summarize(f"""오늘은 {today}입니다.
+오늘 기사 전반 상위 키워드: {keyword_str}
+→ 위 키워드가 시사하는 오늘 시장 분위기를 첫 줄에 한 문장으로 요약해주세요.
 {hot_section_note}
-이를 바탕으로 **카테고리별 종합 요약**과 **투자 인사이트**를 작성해주세요.
+아래 기사별 분석을 바탕으로 카테고리별 종합 요약과 투자 인사이트를 작성해주세요.
 
 작성 조건:
-- 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 엔비디아, CEG(Constellation Energy)
+- 보유 종목: 삼성전자, 와이씨, 두산에너빌리티, 한온시스템, 엔비디아, CEG
 - 비슷한 기사는 묶어서 중복 없이 정리
-- 각 카테고리 3줄 이내 핵심 요약
-- 기사 없는 카테고리는 위 핫이슈 내용을 바탕으로 요약
-- 마지막에 오늘의 투자 인사이트 (전체 종합, 종목별 대응 방향 포함)
+- 각 카테고리 3줄 이내
+- {"⚠️ 리스크 기사가 있으면 해당 종목 대응 방향을 투자 인사이트에 반드시 포함" if critical_articles else ""}
 
 출력 형식:
+📡 오늘의 시장 분위기: (한 문장)
+
 ===== 💾 반도체 요약 =====
 (3줄 이내)
 
 ===== ⚡ 에너지 요약 =====
+(3줄 이내)
+
+===== 🚗 자동차부품(한온시스템) 요약 =====
 (3줄 이내)
 
 ===== 📊 거시경제 요약 =====
@@ -520,27 +660,29 @@ def build_summary(articles: List[Article], today: str) -> str:
 
 --- 기사별 분석 원문 ---
 {per_article_analysis}
-"""
-
-    category_summary = gemini_summarize(category_summary_prompt)
+""")
 
     hot_appendix = (
-        f"\n\n{'='*60}\n\n🔥 기사 없는 카테고리 - 최근 핫이슈 (자체 분석)\n\n{'='*60}\n\n{hot_issue_sections}"
+        f"\n\n{'='*60}\n\n🔥 기사 없는 카테고리 - 최근 핫이슈\n\n{'='*60}\n\n{hot_issue_sections}"
         if hot_issue_sections else ""
     )
 
     return (
         f"{category_summary}"
+        f"\n\n{'='*60}\n\n🤖 AI/AGI 최신 소식 (3줄 요약)\n\n{'='*60}\n\n{ai_summary}"
         f"\n\n{'='*60}\n\n📋 기사별 상세 분석\n\n{'='*60}\n\n{per_article_analysis}"
         f"{hot_appendix}"
     )
 
 
+# ── HTML 생성 ────────────────────────────────────────────────
 CATEGORY_LABEL = {
     "semiconductor": "💾 반도체",
     "energy": "⚡ 에너지",
+    "auto": "🚗 자동차부품(한온시스템)",
     "macro": "📊 거시경제",
     "global_event": "🌏 글로벌 이벤트",
+    "ai": "🤖 AI/AGI",
 }
 
 
@@ -552,6 +694,7 @@ def build_html(header: str, summary: str, articles: List[Article]) -> str:
             continue
         items = "\n".join(
             f'<li>'
+            f'{"<span class=\\"critical\\">⚠️</span> " if a.is_critical else ""}'
             f'<span class="age">{a.published_dt.astimezone(KST).strftime("%H:%M")}</span> '
             f'<a href="{a.url}" target="_blank">{ihtml.escape(a.title)}</a> '
             f'<span class="source">({a.source})</span>'
@@ -581,6 +724,7 @@ def build_html(header: str, summary: str, articles: List[Article]) -> str:
   a:hover {{ text-decoration: underline; }}
   .source {{ color: #999; font-size: 0.82em; }}
   .age {{ color: #e07000; font-size: 0.85em; font-weight: bold; margin-right: 4px; }}
+  .critical {{ color: #d00; font-weight: bold; margin-right: 4px; }}
   .updated {{ color: #aaa; font-size: 0.85em; margin-top: 4px; }}
 </style>
 </head>
@@ -594,15 +738,14 @@ def build_html(header: str, summary: str, articles: List[Article]) -> str:
 </html>"""
 
 
+# ── 카카오 전송 ──────────────────────────────────────────────
 def kakao_send_to_me(access_token: str, text: str, page_url: str) -> None:
     template_object = {
         "object_type": "text",
         "text": text,
         "link": {"web_url": page_url, "mobile_web_url": page_url},
-        "buttons": [{
-            "title": "뉴스 요약 크게보기",
-            "link": {"web_url": page_url, "mobile_web_url": page_url},
-        }],
+        "buttons": [{"title": "뉴스 요약 크게보기",
+                     "link": {"web_url": page_url, "mobile_web_url": page_url}}],
     }
     resp = requests.post(
         "https://kapi.kakao.com/v2/api/talk/memo/default/send",
@@ -614,6 +757,7 @@ def kakao_send_to_me(access_token: str, text: str, page_url: str) -> None:
         raise RuntimeError(f"카카오 전송 실패: {resp.status_code} {resp.text}")
 
 
+# ── 메인 ─────────────────────────────────────────────────────
 def main() -> None:
     load_dotenv()
 
@@ -636,7 +780,6 @@ def main() -> None:
     GITHUB_ID = "schoe5797-debug"
     REPO_NAME = "kakao_news"
     page_url = f"https://{GITHUB_ID}.github.io/{REPO_NAME}/"
-    print(f"[page_url] {page_url}")
 
     token_resp = requests.post(
         "https://kauth.kakao.com/oauth/token",
@@ -647,7 +790,6 @@ def main() -> None:
             "refresh_token": _env("KAKAO_REFRESH_TOKEN"),
         },
     ).json()
-    print(f"[Kakao Token] {token_resp}")
 
     access_token = token_resp.get("access_token")
     if not access_token:
