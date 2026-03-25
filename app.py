@@ -692,15 +692,17 @@ def build_html(header: str, summary: str, articles: List[Article]) -> str:
         cat_articles = [a for a in articles if a.category == cat]
         if not cat_articles:
             continue
-        items = "\n".join(
-            f'<li>'
-            f'{"<span class=\\"critical\\">⚠️</span> " if a.is_critical else ""}'
-            f'<span class="age">{a.published_dt.astimezone(KST).strftime("%H:%M")}</span> '
-            f'<a href="{a.url}" target="_blank">{ihtml.escape(a.title)}</a> '
-            f'<span class="source">({a.source})</span>'
-            f'</li>'
-            for a in cat_articles
-        )
+        def article_li(a: Article) -> str:
+            critical_tag = '<span class="critical">⚠️</span> ' if a.is_critical else ""
+            time_str = a.published_dt.astimezone(KST).strftime("%H:%M")
+            return (
+                f'<li>{critical_tag}'
+                f'<span class="age">{time_str}</span> '
+                f'<a href="{a.url}" target="_blank">{ihtml.escape(a.title)}</a> '
+                f'<span class="source">({a.source})</span>'
+                f'</li>'
+            )
+        items = "\n".join(article_li(a) for a in cat_articles)
         sections += f"<h2>{label}</h2><ul>{items}</ul>\n"
 
     summary_html = ihtml.escape(summary)
